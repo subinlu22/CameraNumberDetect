@@ -9,6 +9,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260627" />
+    <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.13.0.20260627" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="MvCameraControl.Net">
 		<HintPath>C:\Program Files (x86)\MVS\Development\DotNet\AnyCPU\netstandard2.0\MvCameraControl.Net.dll</HintPath>
     </Reference>
