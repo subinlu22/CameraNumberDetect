@@ -1,76 +1,50 @@
-using MvCameraControl;              // Hikrobot Ä«¸Ş¶ó SDK - Ä«¸Ş¶ó °ü·Ã ¸ğµç ±â´ÉÀÌ ¿©±â µé¾îÀÖÀ½
-using OpenCvSharp;                  // [½Å±Ô] OpenCV ±â´É »ç¿ë - Mat, Cv2 µî
+ï»¿using MvCameraControl;              // Hikrobot ì¹´ë©”ë¼ SDK - ì¹´ë©”ë¼ ê´€ë ¨ ëª¨ë“  ê¸°ëŠ¥ì´ ì—¬ê¸° ë“¤ì–´ìˆìŒ
+using OpenCvSharp;                  // OpenCV ê¸°ëŠ¥ ì‚¬ìš© - Mat, Cv2 ë“±
 using System;
-using System.Collections.Generic;   // Ä«¸Ş¶ó ¸ñ·ÏÀ» ´ãÀ» List<> ¾²·Á°í ÇÊ¿äÇÔ
-using System.IO;                    // [½Å±Ô] ÅÛÇÃ¸´ ÆÄÀÏ ÀúÀå/ºÒ·¯¿À±â À§ÇØ ÇÊ¿äÇÔ
-using System.Threading;             // ¿µ»óÀ» °è¼Ó ¹Ş¾Æ¿À´Â ÀÛ¾÷À» º°µµ ½º·¹µå·Î µ¹¸®±â À§ÇØ ÇÊ¿äÇÔ
+using System.Collections.Generic;   // ì¹´ë©”ë¼ ëª©ë¡ì„ ë‹´ì„ List<> ì“°ë ¤ê³  í•„ìš”í•¨
+using System.IO;                    // í•™ìŠµìš© ì´ë¯¸ì§€ ì €ì¥/í´ë” ìƒì„± ìœ„í•´ í•„ìš”í•¨
+using System.Threading;             // ì˜ìƒì„ ê³„ì† ë°›ì•„ì˜¤ëŠ” ì‘ì—…ì„ ë³„ë„ ìŠ¤ë ˆë“œë¡œ ëŒë¦¬ê¸° ìœ„í•´ í•„ìš”í•¨
 using System.Windows.Forms;
 
 namespace CameraNumberDetect
 {
     public partial class Form1 : Form
     {
-        // [Ä«¸Ş¶ó Á¾·ù ¼³Á¤] GigE(·£¼±À¸·Î ¿¬°áÇÏ´Â Ä«¸Ş¶ó) Å¸ÀÔ¸¸ Ã£°Ú´Ù°í ÁöÁ¤
+        // [ì¹´ë©”ë¼ ì¢…ë¥˜ ì„¤ì •] GigE(ëœì„ ìœ¼ë¡œ ì—°ê²°í•˜ëŠ” ì¹´ë©”ë¼) íƒ€ì…ë§Œ ì°¾ê² ë‹¤ê³  ì§€ì •
         readonly DeviceTLayerType enumTLayerType = DeviceTLayerType.MvGigEDevice;
 
-        IDevice device = null;          // ¿¬°áµÈ Ä«¸Ş¶ó¸¦ °¡¸®Å°´Â º¯¼ö
-        bool isGrabbing = false;        // "Áö±İ ¿µ»óÀ» °è¼Ó ¹Ş¾Æ¿À°í ÀÖ´Â ÁßÀÎ°¡?" ½ºÀ§Ä¡
-        Thread receiveThread = null;    // ¿µ»óÀ» °è¼Ó ¹Ş¾Æ¿À´Â ÀÛ¾÷À» ´ã´çÇÒ º°µµ ½º·¹µå
+        IDevice device = null;          // ì—°ê²°ëœ ì¹´ë©”ë¼ë¥¼ ê°€ë¦¬í‚¤ëŠ” ë³€ìˆ˜
+        bool isGrabbing = false;        // "ì§€ê¸ˆ ì˜ìƒì„ ê³„ì† ë°›ì•„ì˜¤ê³  ìˆëŠ” ì¤‘ì¸ê°€?" ìŠ¤ìœ„ì¹˜
+        Thread receiveThread = null;    // ì˜ìƒì„ ê³„ì† ë°›ì•„ì˜¤ëŠ” ì‘ì—…ì„ ë‹´ë‹¹í•  ë³„ë„ ìŠ¤ë ˆë“œ
 
-        // [½Å±Ô] ¼ıÀÚ ÅÛÇÃ¸´ ÀúÀå¼Ò - "1","2","3" °¢°¢ÀÇ ±âÁØ ¸ğ¾ç(À±°û¼±)À» ´ã¾ÆµÒ
-        Dictionary<string, OpenCvSharp.Point[]> digitTemplates = new Dictionary<string, OpenCvSharp.Point[]>();
-        // [½Å±Ô] ÅÛÇÃ¸´ ÀÌ¹ÌÁö ÆÄÀÏÀ» ÀúÀåÇÒ Æú´õ °æ·Î
-        readonly string templateFolder = Path.Combine(Application.StartupPath, "DigitTemplates");
+        // [ì‹ ê·œ] ìë™ì´¬ì˜(í•™ìŠµ ë°ì´í„° ìˆ˜ì§‘) ê´€ë ¨ ìƒíƒœê°’ë“¤
+        bool isAutoCapturing = false;           // "ì§€ê¸ˆ ìë™ì´¬ì˜ ì¤‘ì¸ê°€?" ìŠ¤ìœ„ì¹˜
+        string captureDigit = "";               // ì§€ê¸ˆ ì´¬ì˜ ì¤‘ì¸ ìˆ«ì ("1","2","3")
+        int captureFrameCounter = 0;            // í”„ë ˆì„ì´ ëª‡ ë²ˆ ì§€ë‚˜ê°”ëŠ”ì§€ ì„¸ëŠ” ì¹´ìš´í„°
+        readonly int captureFrameInterval = 5;  // ëª‡ í”„ë ˆì„ë§ˆë‹¤ í•œ ì¥ì”© ì €ì¥í• ì§€ (5ë©´ ëŒ€ëµ ì´ˆë‹¹ 6ì¥ ì •ë„)
+        int captureSavedCount = 0;              // ì´ë²ˆ ì´¬ì˜ì—ì„œ ì§€ê¸ˆê¹Œì§€ ì €ì¥í•œ ì¥ìˆ˜
+        readonly string trainingDataFolder = Path.Combine(Application.StartupPath, "TrainingData");
 
         public Form1()
         {
             InitializeComponent();
             SDKSystem.Initialize();
 
-            // [Ã¢ ´İÈú ¶§ Á¤¸® ÀÛ¾÷ µî·Ï]
+            // [ì°½ ë‹«í ë•Œ ì •ë¦¬ ì‘ì—… ë“±ë¡]
             this.FormClosing += Form1_FormClosing;
 
-            // [Ä«¸Ş¶ó ½ÃÀÛ ½ÃÁ¡] - ÆûÀÌ È­¸é¿¡ ¿ÏÀüÈ÷ ´Ù ¶á ´ÙÀ½(Load ÀÌº¥Æ®)¿¡ ½ÇÇà
+            // [ì¹´ë©”ë¼ ì‹œì‘ ì‹œì ] - í¼ì´ í™”ë©´ì— ì™„ì „íˆ ë‹¤ ëœ¬ ë‹¤ìŒ(Load ì´ë²¤íŠ¸)ì— ì‹¤í–‰
             this.Load += Form1_Load;
         }
 
-        // ch: ÆûÀÌ È­¸é¿¡ ¿ÏÀüÈ÷ ¶á Á÷ÈÄ ÀÚµ¿À¸·Î ½ÇÇàµÇ´Â ÇÔ¼ö
+        // ch: í¼ì´ í™”ë©´ì— ì™„ì „íˆ ëœ¬ ì§í›„ ìë™ìœ¼ë¡œ ì‹¤í–‰ë˜ëŠ” í•¨ìˆ˜
         private void Form1_Load(object sender, EventArgs e)
         {
-            LoadDigitTemplates();   // [½Å±Ô] ÀúÀåµÇ¾î ÀÖ´ø ¼ıÀÚ ÅÛÇÃ¸´ ¸ÕÀú ºÒ·¯¿À±â
             OpenCameraAndStartGrab();
         }
 
-        // [½Å±Ô] ÀúÀåµÈ ¼ıÀÚ ÅÛÇÃ¸´(1.png, 2.png, 3.png) ºÒ·¯¿À´Â ÇÔ¼ö
-        private void LoadDigitTemplates()
-        {
-            if (!Directory.Exists(templateFolder))
-            {
-                Directory.CreateDirectory(templateFolder);
-                System.Diagnostics.Debug.WriteLine("ÅÛÇÃ¸´ Æú´õ°¡ ¾ø¾î¼­ »õ·Î ¸¸µê - ¾ÆÁ÷ ÅÛÇÃ¸´ ¾øÀ½");
-                return;
-            }
-
-            string[] digitNames = { "1", "2", "3" };
-            foreach (string digit in digitNames)
-            {
-                string path = Path.Combine(templateFolder, digit + ".png");
-                if (File.Exists(path))
-                {
-                    using (Mat templateMask = Cv2.ImRead(path, ImreadModes.Grayscale))
-                    {
-                        OpenCvSharp.Point[] biggest = GetBiggestContour(templateMask);
-                        if (biggest != null)
-                        {
-                            digitTemplates[digit] = biggest;
-                            System.Diagnostics.Debug.WriteLine($"ÅÛÇÃ¸´ ºÒ·¯¿È: ¼ıÀÚ {digit}");
-                        }
-                    }
-                }
-            }
-        }
-
-        // [½Å±Ô] ¸¶½ºÅ©(Èò»ö ¿µ¿ª) ¾È¿¡¼­ Á¦ÀÏ Å« À±°û¼± ÇÏ³ª¸¸ »Ì¾ÆÁÖ´Â °ø¿ë ÇÔ¼ö
+        // [ì‹ ê·œ] ë§ˆìŠ¤í¬(í°ìƒ‰ ì˜ì—­) ì•ˆì—ì„œ ì œì¼ í° ìœ¤ê³½ì„  í•˜ë‚˜ë§Œ ë½‘ì•„ì£¼ëŠ” ê³µìš© í•¨ìˆ˜
+        // (CropLidAreaì—ì„œ ëšœê»‘ ì˜ì—­ ì°¾ì„ ë•Œ ì‚¬ìš© ì¤‘ - ê³„ì† ìœ ì§€)
         private OpenCvSharp.Point[] GetBiggestContour(Mat mask)
         {
             Cv2.FindContours(mask, out OpenCvSharp.Point[][] contours, out HierarchyIndex[] hierarchy,
@@ -95,70 +69,36 @@ namespace CameraNumberDetect
             return biggest;
         }
 
-        // [½Å±Ô] Áö±İ º¸ÀÌ´Â ¼ıÀÚ ¸¶½ºÅ©¸¦ ÅÛÇÃ¸´(±âÁØ)À¸·Î ÀúÀåÇÏ´Â ÇÔ¼ö
-        private void SaveDigitTemplate(Mat digitMask, string digitName)
+        // [ì‹ ê·œ] ìë™ì´¬ì˜ ì¤‘ì¸ ëšœê»‘ ì´ë¯¸ì§€ë¥¼ ìƒ‰ê¹”+ìˆ«ìë³„ í´ë”ì— ì €ì¥í•˜ëŠ” í•¨ìˆ˜
+        // (íŒŒì¼ëª…ì€ íƒ€ì„ìŠ¤íƒ¬í”„ë¼ ì ˆëŒ€ ì•ˆ ê²¹ì¹¨ - ì—¬ëŸ¬ ë²ˆ ë‚˜ëˆ  ì°ì–´ë„ ì•ˆì „)
+        private void SaveTrainingImage(Mat croppedLid, string lidColor, string digit)
         {
-            string path = Path.Combine(templateFolder, digitName + ".png");
-            Cv2.ImWrite(path, digitMask);
-            System.Diagnostics.Debug.WriteLine($"ÅÛÇÃ¸´ ÀúÀåµÊ: ¼ıÀÚ {digitName} ¡æ {path}");
-
-            OpenCvSharp.Point[] biggest = GetBiggestContour(digitMask);
-            if (biggest != null)
+            string folder = Path.Combine(trainingDataFolder, $"{lidColor}_{digit}");
+            if (!Directory.Exists(folder))
             {
-                digitTemplates[digitName] = biggest;
+                Directory.CreateDirectory(folder);
             }
+
+            // [íŒŒì¼ëª…] yyyyMMdd_HHmmss_fff (ë°€ë¦¬ì´ˆê¹Œì§€) - ì—°ì† ì €ì¥ì´ë¼ ì´ˆ ë‹¨ìœ„ë¡  ê²¹ì¹  ìˆ˜ ìˆì–´ì„œ ë°€ë¦¬ì´ˆê¹Œì§€ ì”€
+            string fileName = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + ".png";
+            string fullPath = Path.Combine(folder, fileName);
+
+            Cv2.ImWrite(fullPath, croppedLid);
+            captureSavedCount++;
+
+            System.Diagnostics.Debug.WriteLine($"í•™ìŠµì´ë¯¸ì§€ ì €ì¥: {lidColor}_{digit} â†’ {fileName} (ëˆ„ì  {captureSavedCount}ì¥)");
         }
 
-        // [½Å±Ô] Áö±İ º¸ÀÌ´Â ¼ıÀÚ ¸ğ¾çÀ» ÀúÀåµÈ ÅÛÇÃ¸´(1,2,3)µé°ú ºñ±³ÇØ¼­
-        // Á¦ÀÏ ºñ½ÁÇÑ °É Ã£¾Æ³»´Â ÇÔ¼ö
-        private string RecognizeDigit(Mat digitMask)
-        {
-            if (digitTemplates.Count == 0)
-            {
-                return "ÅÛÇÃ¸´ ¾øÀ½";
-            }
-
-            OpenCvSharp.Point[] biggest = GetBiggestContour(digitMask);
-            if (biggest == null)
-            {
-                return "¼ıÀÚ ¸øÃ£À½";
-            }
-
-            string bestMatch = "ÆÇÁ¤ºÒ°¡";
-            double bestScore = double.MaxValue;
-
-            foreach (var pair in digitTemplates)
-            {
-                double score = Cv2.MatchShapes(biggest, pair.Value, ShapeMatchModes.I1);
-                System.Diagnostics.Debug.WriteLine($"  ¼ıÀÚ {pair.Key}°ú ºñ±³ Á¡¼ö: {score:F3}");
-
-                if (score < bestScore)
-                {
-                    bestScore = score;
-                    bestMatch = pair.Key;
-                }
-            }
-
-            // [º¯°æ] ÀÓ°è°ª 0.3 ¡æ 10À¸·Î »óÇâ - ½ÇÃø Á¡¼ö(10~60´ë)°¡ ¿¹»óº¸´Ù ÈÎ¾À Ä¿¼­
-            // ÀÏ´Ü ³Ë³ËÇÏ°Ô Àâ¾ÆµÎ°í, ³ªÁß¿¡ ·Î±× º¸¸é¼­ ´Ù½Ã Á¼Çô³ª°¥ ¿¹Á¤
-            if (bestScore > 10)
-            {
-                return "ÆÇÁ¤ºÒ°¡";
-            }
-
-            return bestMatch;
-        }
-
-        // ch: Ä«¸Ş¶ó¸¦ Ã£¾Æ¼­ ¿­°í, ¿µ»ó ¹Ş±â¸¦ ½ÃÀÛÇÏ´Â ÇÔ¼ö
+        // ch: ì¹´ë©”ë¼ë¥¼ ì°¾ì•„ì„œ ì—´ê³ , ì˜ìƒ ë°›ê¸°ë¥¼ ì‹œì‘í•˜ëŠ” í•¨ìˆ˜
         private void OpenCameraAndStartGrab()
         {
-            // [Ä«¸Ş¶ó ¸ñ·Ï Ã£±â]
+            // [ì¹´ë©”ë¼ ëª©ë¡ ì°¾ê¸°]
             List<IDeviceInfo> deviceInfoList;
             int result = DeviceEnumerator.EnumDevices(enumTLayerType, out deviceInfoList);
 
             if (result != MvError.MV_OK || deviceInfoList.Count == 0)
             {
-                MessageBox.Show("Ä«¸Ş¶ó¸¦ Ã£À» ¼ö ¾ø½À´Ï´Ù. ¿¬°á »óÅÂ¸¦ È®ÀÎÇØÁÖ¼¼¿ä.");
+                MessageBox.Show("ì¹´ë©”ë¼ë¥¼ ì°¾ì„ ìˆ˜ ì—†ìŠµë‹ˆë‹¤. ì—°ê²° ìƒíƒœë¥¼ í™•ì¸í•´ì£¼ì„¸ìš”.");
                 return;
             }
 
@@ -168,7 +108,7 @@ namespace CameraNumberDetect
             result = device.Open();
             if (result != MvError.MV_OK)
             {
-                MessageBox.Show("Ä«¸Ş¶ó ¿­±â ½ÇÆĞ! ¿¡·¯ÄÚµå: " + result);
+                MessageBox.Show("ì¹´ë©”ë¼ ì—´ê¸° ì‹¤íŒ¨! ì—ëŸ¬ì½”ë“œ: " + result);
                 return;
             }
 
@@ -196,7 +136,7 @@ namespace CameraNumberDetect
             receiveThread.Start();
         }
 
-        // ch: ¿µ»óÀ» °è¼Ó ¹İº¹ÇØ¼­ ¹Ş¾Æ¿À´Â ÇÔ¼ö (º°µµ ½º·¹µå¿¡¼­ ½ÇÇàµÊ)
+        // ch: ì˜ìƒì„ ê³„ì† ë°˜ë³µí•´ì„œ ë°›ì•„ì˜¤ëŠ” í•¨ìˆ˜ (ë³„ë„ ìŠ¤ë ˆë“œì—ì„œ ì‹¤í–‰ë¨)
         private void ReceiveThreadProcess()
         {
             while (isGrabbing)
@@ -207,7 +147,7 @@ namespace CameraNumberDetect
                 if (result == MvError.MV_OK)
                 {
                     System.Diagnostics.Debug.WriteLine(
-                        "ÇÁ·¹ÀÓ ¹ŞÀ½! Å©±â: " + frameOut.Image.Width + " x " + frameOut.Image.Height);
+                        "í”„ë ˆì„ ë°›ìŒ! í¬ê¸°: " + frameOut.Image.Width + " x " + frameOut.Image.Height);
 
                     Mat bayerMat = Mat.FromPixelData(
                         (int)frameOut.Image.Height,
@@ -216,7 +156,7 @@ namespace CameraNumberDetect
                         frameOut.Image.PixelDataPtr);
 
                     Cv2.MinMaxLoc(bayerMat, out double minVal, out double maxVal);
-                    System.Diagnostics.Debug.WriteLine($"ÇÈ¼¿ °ª ¹üÀ§: min={minVal}, max={maxVal}");
+                    System.Diagnostics.Debug.WriteLine($"í”½ì…€ ê°’ ë²”ìœ„: min={minVal}, max={maxVal}");
 
                     Mat mat = new Mat();
                     Cv2.CvtColor(bayerMat, mat, ColorConversionCodes.BayerGR2BGR);
@@ -225,34 +165,53 @@ namespace CameraNumberDetect
                     Mat displayMat = new Mat();
                     Cv2.Resize(mat, displayMat, new OpenCvSharp.Size(mat.Width / 3, mat.Height / 3));
 
-                    Cv2.ImShow("OpenCV Å×½ºÆ®", displayMat);
-
                     string lidColor = ClassifyLidColor(displayMat);
-                    System.Diagnostics.Debug.WriteLine("ÆÇÁ¤µÈ »ö±ò: " + lidColor);
+                    System.Diagnostics.Debug.WriteLine("íŒì •ëœ ìƒ‰ê¹”: " + lidColor);
 
                     using (Mat croppedLid = CropLidArea(displayMat))
                     {
-                        Cv2.ImShow("¶Ñ²± Å©·Ó È®ÀÎ", croppedLid);
-
-                        using (Mat digitMask = ExtractDigitMask(croppedLid, lidColor))
+                        // [ì‹ ê·œ] ìë™ì´¬ì˜ ì¤‘ì´ë©´ - ëª‡ í”„ë ˆì„ë§ˆë‹¤ í•œ ì¥ì”© í¬ë¡­ëœ ëšœê»‘ ì´ë¯¸ì§€ë¥¼ ì €ì¥
+                        // (ë§ˆìŠ¤í¬ê°€ ì•„ë‹ˆë¼ ìƒ‰ìƒ ì›ë³¸ì„ ì €ì¥ - CNNì´ ìƒ‰ìƒ ì •ë³´ê¹Œì§€ ë³´ê³  í•™ìŠµí•´ì•¼ í•˜ë‹ˆê¹Œ)
+                        if (isAutoCapturing)
                         {
-                            Cv2.ImShow("¼ıÀÚ ¸¶½ºÅ© È®ÀÎ", digitMask);
-
-                            int digitPixels = Cv2.CountNonZero(digitMask);
-                            double digitRatio = (double)digitPixels / (digitMask.Rows * digitMask.Cols) * 100;
-                            System.Diagnostics.Debug.WriteLine($"¼ıÀÚ·Î ÀÎ½ÄµÈ ¿µ¿ª: {digitRatio:F1}%");
-
-                            int key = Cv2.WaitKey(1);
-                            if (key == '1' || key == '2' || key == '3')
+                            captureFrameCounter++;
+                            if (captureFrameCounter >= captureFrameInterval)
                             {
-                                string digitName = ((char)key).ToString();
-                                SaveDigitTemplate(digitMask, digitName);
+                                captureFrameCounter = 0;
+                                SaveTrainingImage(croppedLid, lidColor, captureDigit);
                             }
-                            else
-                            {
-                                string recognizedDigit = RecognizeDigit(digitMask);
-                                System.Diagnostics.Debug.WriteLine("ÀÎ½ÄµÈ ¼ıÀÚ: " + recognizedDigit);
-                            }
+
+                            // [í™”ë©´ í‘œì‹œ] ì§€ê¸ˆ ì´¬ì˜ ì¤‘ì´ë¼ëŠ” ê±¸ ë¹¨ê°„ ê¸€ì”¨ë¡œ í‘œì‹œ - ì½˜ì†” ì•ˆ ë´ë„ ë°”ë¡œ ì•Œ ìˆ˜ ìˆê²Œ
+                            string overlayText = $"ìë™ì´¬ì˜ ì¤‘: ìˆ«ì{captureDigit} ({captureSavedCount}ì¥)";
+                            Cv2.PutText(displayMat, overlayText, new OpenCvSharp.Point(10, 30),
+                                HersheyFonts.HersheySimplex, 0.8, new Scalar(0, 0, 255), 2);
+                        }
+
+                        Cv2.ImShow("ëšœê»‘ í¬ë¡­ í™•ì¸", croppedLid);
+                    }
+
+                    Cv2.ImShow("OpenCV í…ŒìŠ¤íŠ¸", displayMat);
+
+                    // [ì‹ ê·œ] í‚¤ 1/2/3 - ìë™ì´¬ì˜ í† ê¸€ (ê°™ì€ í‚¤ ë‹¤ì‹œ ëˆ„ë¥´ë©´ ì¤‘ì§€)
+                    int key = Cv2.WaitKey(1);
+                    if (key == '1' || key == '2' || key == '3')
+                    {
+                        string pressedDigit = ((char)key).ToString();
+
+                        if (isAutoCapturing && captureDigit == pressedDigit)
+                        {
+                            // ê°™ì€ ìˆ«ìí‚¤ë¥¼ ë‹¤ì‹œ ëˆ„ë¦„ â†’ ì´¬ì˜ ì¢…ë£Œ
+                            isAutoCapturing = false;
+                            System.Diagnostics.Debug.WriteLine($"ìë™ì´¬ì˜ ì¢…ë£Œ: ìˆ«ì{captureDigit}, ì´ {captureSavedCount}ì¥ ì €ì¥ë¨");
+                        }
+                        else
+                        {
+                            // ìƒˆë¡œ ì‹œì‘ (ë‹¤ë¥¸ ìˆ«ìë¥¼ ëˆ„ë¥¸ ê²½ìš° - ì´ì „ ìˆ«ì ì´¬ì˜ì€ ì¤‘ë‹¨í•˜ê³  ìƒˆ ìˆ«ìë¡œ ì „í™˜)
+                            isAutoCapturing = true;
+                            captureDigit = pressedDigit;
+                            captureFrameCounter = 0;
+                            captureSavedCount = 0;
+                            System.Diagnostics.Debug.WriteLine($"ìë™ì´¬ì˜ ì‹œì‘: ìˆ«ì{captureDigit}");
                         }
                     }
 
@@ -263,12 +222,12 @@ namespace CameraNumberDetect
                 }
                 else
                 {
-                    System.Diagnostics.Debug.WriteLine("ÇÁ·¹ÀÓ ¹Ş±â ½ÇÆĞ, ¿¡·¯ÄÚµå: " + result);
+                    System.Diagnostics.Debug.WriteLine("í”„ë ˆì„ ë°›ê¸° ì‹¤íŒ¨, ì—ëŸ¬ì½”ë“œ: " + result);
                 }
             }
         }
 
-        // [½Å±Ô] ¶Ñ²±ÀÌ ÀÖ´Â ¿µ¿ª¸¸ »ç°¢ÇüÀ¸·Î µü Àß¶ó³»´Â ÇÔ¼ö
+        // [ì‹ ê·œ] ëšœê»‘ì´ ìˆëŠ” ì˜ì—­ë§Œ ì‚¬ê°í˜•ìœ¼ë¡œ ë”± ì˜ë¼ë‚´ëŠ” í•¨ìˆ˜
         private Mat CropLidArea(Mat colorMat)
         {
             using (Mat gray = new Mat())
@@ -289,8 +248,8 @@ namespace CameraNumberDetect
             }
         }
 
-        // [½Å±Ô] ¶Ñ²± »ö±ò¿¡ µû¶ó ¼ıÀÚ »ö»ó ÇÊÅÍ¸¦ ÀÚµ¿À¸·Î °ñ¶ó¼­
-        // ¼ıÀÚ ºÎºĞ¸¸ ¸¶½ºÅ©(Èò»ö)·Î »Ì¾Æ³»´Â ÇÔ¼ö
+        // [ì‹ ê·œ] ëšœê»‘ ìƒ‰ê¹”ì— ë”°ë¼ ìˆ«ì ìƒ‰ìƒ í•„í„°ë¥¼ ìë™ìœ¼ë¡œ ê³¨ë¼ì„œ
+        // ìˆ«ì ë¶€ë¶„ë§Œ ë§ˆìŠ¤í¬(í°ìƒ‰)ë¡œ ë½‘ì•„ë‚´ëŠ” í•¨ìˆ˜
         private Mat ExtractDigitMask(Mat croppedLid, string lidColor)
         {
             Mat hsv = new Mat();
@@ -298,19 +257,19 @@ namespace CameraNumberDetect
 
             Mat mask = new Mat();
 
-            if (lidColor == "È­ÀÌÆ®")
+            if (lidColor == "í™”ì´íŠ¸")
             {
-                // [º¯°æ] °íÁ¤°ª(90) ´ë½Å, Áö±İ ¶Ñ²±ÀÇ Æò±Õ ¹à±â ´ëºñ »ó´ëÀûÀ¸·Î ¾îµÎ¿î ºÎºĞ¸¸ °ËÁ¤ ¼ıÀÚ·Î ÆÇ´Ü
+                // [ë³€ê²½] ê³ ì •ê°’(90) ëŒ€ì‹ , ì§€ê¸ˆ ëšœê»‘ì˜ í‰ê·  ë°ê¸° ëŒ€ë¹„ ìƒëŒ€ì ìœ¼ë¡œ ì–´ë‘ìš´ ë¶€ë¶„ë§Œ ê²€ì • ìˆ«ìë¡œ íŒë‹¨
                 Scalar overallMean = Cv2.Mean(hsv);
                 double avgVal = overallMean.Val2;
                 double darkThreshold = avgVal * 0.5;
                 Cv2.InRange(hsv, new Scalar(0, 0, 0), new Scalar(180, 255, darkThreshold), mask);
             }
-            else if (lidColor == "ÆÄ¶û")
+            else if (lidColor == "íŒŒë‘")
             {
                 Cv2.InRange(hsv, new Scalar(15, 80, 80), new Scalar(35, 255, 255), mask);
             }
-            else if (lidColor == "»¡°­")
+            else if (lidColor == "ë¹¨ê°•")
             {
                 Cv2.InRange(hsv, new Scalar(90, 80, 60), new Scalar(130, 255, 255), mask);
             }
@@ -319,10 +278,10 @@ namespace CameraNumberDetect
                 mask = Mat.Zeros(croppedLid.Size(), MatType.CV_8UC1);
             }
 
-            // [½Å±Ô] ¸ğÆú·ÎÁö ´İÈû(Closing) ¿¬»ê - ±Û¸®ÅÍ ¹İÂ¦ÀÌ ¶§¹®¿¡ ÀÚÀßÇÏ°Ô ÂÉ°³Áø
-            // Èò Á¡µéÀ» °¡±î¿î °Í³¢¸® ¹¶ÃÄ¼­ ¼ıÀÚ ÇÏ³ª°¡ ¸Å²öÇÑ µ¢¾î¸®·Î º¸ÀÌ°Ô ¸¸µê
-            // (ÆØÃ¢(Dilate)À¸·Î ºÎÇ®·Á¼­ Æ´À» ¸Ş¿î ´ÙÀ½, Ä§½Ä(Erode)À¸·Î ´Ù½Ã ¿ø·¡
-            //  Å©±â·Î ÁÙÀÌ´Â ¹æ½Ä - Å©±â´Â °ÅÀÇ ±×´ë·Î À¯ÁöµÇ¸é¼­ Æ´¸¸ ¸Ş¿öÁü)
+            // [ì‹ ê·œ] ëª¨í´ë¡œì§€ ë‹«í˜(Closing) ì—°ì‚° - ê¸€ë¦¬í„° ë°˜ì§ì´ ë•Œë¬¸ì— ìì˜í•˜ê²Œ ìª¼ê°œì§„
+            // í° ì ë“¤ì„ ê°€ê¹Œìš´ ê²ƒë¼ë¦¬ ë­‰ì³ì„œ ìˆ«ì í•˜ë‚˜ê°€ ë§¤ëˆí•œ ë©ì–´ë¦¬ë¡œ ë³´ì´ê²Œ ë§Œë“¦
+            // (íŒ½ì°½(Dilate)ìœ¼ë¡œ ë¶€í’€ë ¤ì„œ í‹ˆì„ ë©”ìš´ ë‹¤ìŒ, ì¹¨ì‹(Erode)ìœ¼ë¡œ ë‹¤ì‹œ ì›ë˜
+            //  í¬ê¸°ë¡œ ì¤„ì´ëŠ” ë°©ì‹ - í¬ê¸°ëŠ” ê±°ì˜ ê·¸ëŒ€ë¡œ ìœ ì§€ë˜ë©´ì„œ í‹ˆë§Œ ë©”ì›Œì§)
             Mat kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new OpenCvSharp.Size(7, 7));
             Cv2.MorphologyEx(mask, mask, MorphTypes.Close, kernel);
             kernel.Dispose();
@@ -331,7 +290,7 @@ namespace CameraNumberDetect
             return mask;
         }
 
-        // [½Å±Ô] ¶Ñ²± »ö±ò ÆÇÁ¤ ÇÔ¼ö
+        // [ì‹ ê·œ] ëšœê»‘ ìƒ‰ê¹” íŒì • í•¨ìˆ˜
         private string ClassifyLidColor(Mat colorMat)
         {
             using (Mat gray = new Mat())
@@ -343,7 +302,7 @@ namespace CameraNumberDetect
 
                 int maskPixels = Cv2.CountNonZero(mask);
                 double maskRatio = (double)maskPixels / (mask.Rows * mask.Cols) * 100;
-                System.Diagnostics.Debug.WriteLine($"¶Ñ²±À¸·Î ÀÎ½ÄµÈ ¿µ¿ª: {maskRatio:F1}%");
+                System.Diagnostics.Debug.WriteLine($"ëšœê»‘ìœ¼ë¡œ ì¸ì‹ëœ ì˜ì—­: {maskRatio:F1}%");
 
                 Cv2.CvtColor(colorMat, hsv, ColorConversionCodes.BGR2HSV);
                 Scalar meanHsv = Cv2.Mean(hsv, mask);
@@ -352,28 +311,28 @@ namespace CameraNumberDetect
                 double avgVal = meanHsv.Val2;
 
                 System.Diagnostics.Debug.WriteLine(
-                    $"Æò±Õ »ö»ó - Hue:{avgHue:F1}, Sat:{avgSat:F1}, Val:{avgVal:F1}");
+                    $"í‰ê·  ìƒ‰ìƒ - Hue:{avgHue:F1}, Sat:{avgSat:F1}, Val:{avgVal:F1}");
 
                 if (avgSat < 40)
                 {
-                    return "È­ÀÌÆ®";
+                    return "í™”ì´íŠ¸";
                 }
                 else if (avgHue <= 25 || avgHue >= 155)
                 {
-                    return "»¡°­";
+                    return "ë¹¨ê°•";
                 }
                 else if (avgHue >= 100 && avgHue <= 130)
                 {
-                    return "ÆÄ¶û";
+                    return "íŒŒë‘";
                 }
                 else
                 {
-                    return "ÆÇÁ¤ºÒ°¡";
+                    return "íŒì •ë¶ˆê°€";
                 }
             }
         }
 
-        // ch: ÇÁ·Î±×·¥(Ã¢)À» ´İÀ» ¶§ ½ÇÇàµÇ´Â Á¤¸® ÇÔ¼ö
+        // ch: í”„ë¡œê·¸ë¨(ì°½)ì„ ë‹«ì„ ë•Œ ì‹¤í–‰ë˜ëŠ” ì •ë¦¬ í•¨ìˆ˜
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
             isGrabbing = false;
