@@ -3,8 +3,13 @@ using OpenCvSharp;                  // OpenCV 기능 사용 - Mat, Cv2 등
 using System;
 using System.Collections.Generic;   // 카메라 목록을 담을 List<> 쓰려고 필요함
 using System.IO;                    // 학습용 이미지 저장/폴더 생성 위해 필요함
+using System.Linq;                  // 배열에서 제일 큰 값의 위치 찾을 때(argmax) 필요함
+using System.Text.Json;             // label_map.json 읽을 때 필요함
 using System.Threading;             // 영상을 계속 받아오는 작업을 별도 스레드로 돌리기 위해 필요함
 using System.Windows.Forms;
+using System.Runtime.InteropServices; // 비트맵 픽셀 데이터 직접 다룰 때 필요함 (한글 텍스트 그리기용)
+using Microsoft.ML.OnnxRuntime;         // ONNX 모델 불러와서 추론 실행하는 기능
+using Microsoft.ML.OnnxRuntime.Tensors; // 모델에 넣을 입력 데이터(텐서) 만드는 기능
 
 namespace CameraNumberDetect
 {
@@ -25,10 +30,25 @@ namespace CameraNumberDetect
         int captureSavedCount = 0;              // 이번 촬영에서 지금까지 저장한 장수
         readonly string trainingDataFolder = Path.Combine(Application.StartupPath, "TrainingData");
 
+        // [신규] 숫자 인식 CNN 모델 관련
+        InferenceSession digitOnnxSession = null;      // ONNX 모델을 불러와서 추론 실행하는 객체
+        Dictionary<string, string> digitLabelMap;      // 모델 출력 번호(0,1,2) → 실제 숫자("1","2","3") 매핑
+        // [뚜껑색 → 숫자색 매핑] 숫자 색깔은 뚜껑 색깔에 100% 종속되어 있어서(스펙 고정값),
+        // 카메라로 다시 "감지"할 필요 없이 이 표만 찾아보면 됨
+        readonly Dictionary<string, string> lidToDigitColorMap = new Dictionary<string, string>
+        {
+            { "화이트", "검정" },
+            { "파랑", "노랑" },
+            { "빨강", "파랑" },
+        };
+
         public Form1()
         {
             InitializeComponent();
             SDKSystem.Initialize();
+
+            // [신규] 숫자 인식 CNN 모델 불러오기 - 프로그램 켤 때 딱 한 번만 로딩
+            LoadDigitOnnxModel();
 
             // [창 닫힐 때 정리 작업 등록]
             this.FormClosing += Form1_FormClosing;
@@ -37,10 +57,103 @@ namespace CameraNumberDetect
             this.Load += Form1_Load;
         }
 
+        // [신규] digit_cnn.onnx + label_map.json을 불러와서 준비해두는 함수
+        // (매 프레임마다 다시 불러오면 느리니까, 프로그램 시작할 때 딱 한 번만 실행)
+        private void LoadDigitOnnxModel()
+        {
+            try
+            {
+                string onnxPath = Path.Combine(Application.StartupPath, "digit_cnn.onnx");
+                string labelMapPath = Path.Combine(Application.StartupPath, "label_map.json");
+
+                digitOnnxSession = new InferenceSession(onnxPath);
+
+                string labelMapJson = File.ReadAllText(labelMapPath);
+                digitLabelMap = JsonSerializer.Deserialize<Dictionary<string, string>>(labelMapJson);
+
+                System.Diagnostics.Debug.WriteLine("숫자 인식 CNN 모델 로딩 완료");
+            }
+            catch (Exception ex)
+            {
+                // [실패해도 프로그램은 계속 돌아가게] 모델 로딩 실패해도 카메라 자체는 써야 하니까
+                // 여기서 프로그램을 죽이지 않고, 대신 나중에 추론 시도할 때 null 체크로 건너뜀
+                digitOnnxSession = null;
+                MessageBox.Show("숫자 인식 모델(digit_cnn.onnx) 로딩 실패: " + ex.Message +
+                    "\n\ndigit_cnn.onnx, label_map.json 파일이 실행파일과 같은 폴더에 있는지 확인해줘.");
+            }
+        }
+
         // ch: 폼이 화면에 완전히 뜬 직후 자동으로 실행되는 함수
         private void Form1_Load(object sender, EventArgs e)
         {
             OpenCameraAndStartGrab();
+        }
+
+        // [신규] OpenCV의 Cv2.PutText는 한글을 못 그리는 한계가 있어서(Hershey 폰트에
+        // 한글 글자 모양 자체가 없음), 대신 윈도우 System.Drawing으로 한글 텍스트를
+        // 그린 다음 그 결과만 이미지 위에 얹는 방식으로 우회하는 함수.
+        // color 파라미터는 OpenCV 스타일(B,G,R 순서)의 Scalar를 그대로 받음
+        private void PutKoreanText(Mat img, string text, System.Drawing.Point origin, float fontSizePt, Scalar color)
+        {
+            // [1단계] 글자가 그려질 정확한 크기를 먼저 재봄 (너무 작으면 잘리고, 너무 크면 낭비니까)
+            System.Drawing.SizeF measuredSize;
+            using (var measureBmp = new System.Drawing.Bitmap(1, 1))
+            using (var measureG = System.Drawing.Graphics.FromImage(measureBmp))
+            using (var measureFont = new System.Drawing.Font("맑은 고딕", fontSizePt, System.Drawing.FontStyle.Bold))
+            {
+                measuredSize = measureG.MeasureString(text, measureFont);
+            }
+
+            int bmpWidth = (int)Math.Ceiling(measuredSize.Width) + 4;
+            int bmpHeight = (int)Math.Ceiling(measuredSize.Height) + 4;
+
+            // [2단계] 투명 배경 비트맵에 흰색으로 텍스트만 그림
+            // (실제 색은 나중에 입힐 거라, 여기서는 "글자가 있는 위치"만 알면 됨)
+            using (var bmp = new System.Drawing.Bitmap(bmpWidth, bmpHeight, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+            {
+                using (var g = System.Drawing.Graphics.FromImage(bmp))
+                using (var font = new System.Drawing.Font("맑은 고딕", fontSizePt, System.Drawing.FontStyle.Bold))
+                using (var brush = new System.Drawing.SolidBrush(System.Drawing.Color.White))
+                {
+                    g.Clear(System.Drawing.Color.Transparent);
+                    g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+                    g.DrawString(text, font, brush, 2, 2);
+                }
+
+                // [3단계] 비트맵 픽셀을 직접 읽어서, 글자가 그려진(알파값 있는) 부분만
+                // 원하는 색으로 이미지 위에 찍음 (배경은 그대로 안 건드림)
+                var bmpData = bmp.LockBits(
+                    new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height),
+                    System.Drawing.Imaging.ImageLockMode.ReadOnly,
+                    System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+
+                int stride = bmpData.Stride;
+                byte[] pixelData = new byte[stride * bmp.Height];
+                Marshal.Copy(bmpData.Scan0, pixelData, 0, pixelData.Length);
+                bmp.UnlockBits(bmpData);
+
+                Vec3b drawColor = new Vec3b((byte)color.Val0, (byte)color.Val1, (byte)color.Val2);
+
+                for (int y = 0; y < bmp.Height; y++)
+                {
+                    int imgY = origin.Y + y;
+                    if (imgY < 0 || imgY >= img.Rows) continue;
+
+                    for (int x = 0; x < bmp.Width; x++)
+                    {
+                        int imgX = origin.X + x;
+                        if (imgX < 0 || imgX >= img.Cols) continue;
+
+                        // [Format32bppArgb 메모리 순서] 픽셀당 4바이트: B, G, R, A 순서
+                        int idx = y * stride + x * 4;
+                        byte alpha = pixelData[idx + 3];
+                        if (alpha > 50) // 글자 안쪽(불투명한 부분)만 색칠
+                        {
+                            img.Set(imgY, imgX, drawColor);
+                        }
+                    }
+                }
+            }
         }
 
         // [신규] 마스크(흰색 영역) 안에서 제일 큰 윤곽선 하나만 뽑아주는 공용 함수
@@ -183,8 +296,28 @@ namespace CameraNumberDetect
 
                             // [화면 표시] 지금 촬영 중이라는 걸 빨간 글씨로 표시 - 콘솔 안 봐도 바로 알 수 있게
                             string overlayText = $"자동촬영 중: 숫자{captureDigit} ({captureSavedCount}장)";
-                            Cv2.PutText(displayMat, overlayText, new OpenCvSharp.Point(10, 30),
-                                HersheyFonts.HersheySimplex, 0.8, new Scalar(0, 0, 255), 2);
+                            PutKoreanText(displayMat, overlayText, new System.Drawing.Point(10, 10), 20f, new Scalar(0, 0, 255));
+                        }
+
+                        // [신규] CNN으로 숫자 판정 - 전처리 → 추론 → 뚜껑색/숫자색/숫자 합쳐서 화면에 표시
+                        // (뚜껑이 화면에 없으면(lidColor=="없음") 판정 자체를 건너뜀 - 노이즈 오판정 방지)
+                        if (lidColor != "없음")
+                        {
+                            using (Mat digitPatch = ExtractDigitPatchForCnn(croppedLid))
+                            {
+                                if (digitPatch != null)
+                                {
+                                    string predictedDigit = RunDigitInference(digitPatch);
+                                    if (predictedDigit != null && lidToDigitColorMap.ContainsKey(lidColor))
+                                    {
+                                        string digitColor = lidToDigitColorMap[lidColor];
+                                        string resultText = $"{lidColor} 뚜껑, {digitColor} 숫자 {predictedDigit}";
+
+                                        // [화면 표시] 판정 결과는 초록색 글씨로 (자동촬영 빨간 글씨 아래쪽에)
+                                        PutKoreanText(displayMat, resultText, new System.Drawing.Point(10, 45), 20f, new Scalar(0, 255, 0));
+                                    }
+                                }
+                            }
                         }
 
                         Cv2.ImShow("뚜껑 크롭 확인", croppedLid);
@@ -248,49 +381,193 @@ namespace CameraNumberDetect
             }
         }
 
-        // [신규] 뚜껑 색깔에 따라 숫자 색상 필터를 자동으로 골라서
-        // 숫자 부분만 마스크(흰색)로 뽑아내는 함수
-        private Mat ExtractDigitMask(Mat croppedLid, string lidColor)
+        // [신규] 파이썬 train_digit_cnn.py의 extract_digit_patch()를 C#으로 완전히 동일하게 재현.
+        // CNN은 학습 때 본 것과 똑같은 방식으로 전처리된 입력을 받아야 정확도가 나오기 때문에,
+        // 여기 로직은 파이썬 쪽이랑 한 글자도 다르면 안 됨 (숫자만 조금 바꿔도 결과가 달라질 수 있음).
+        // 반환값: 숫자만 깔끔하게 뽑힌 64x64 흑백 이미지 (못 찾으면 null)
+        private Mat ExtractDigitPatchForCnn(Mat croppedLidBgr, int outSize = 64)
         {
-            Mat hsv = new Mat();
-            Cv2.CvtColor(croppedLid, hsv, ColorConversionCodes.BGR2HSV);
+            int h = croppedLidBgr.Rows;
+            int w = croppedLidBgr.Cols;
 
+            // [원형 관심영역(ROI)] 사각형 귀퉁이(뚜껑 바깥 배경)를 아예 분석에서 제외
+            Mat roiMask = new Mat(h, w, MatType.CV_8UC1, Scalar.All(0));
+            int roiRadius = (int)(Math.Min(h, w) * 0.48);
+            Cv2.Circle(roiMask, new OpenCvSharp.Point(w / 2, h / 2), roiRadius, Scalar.All(255), -1);
+
+            // [배경색 추정] 원형 영역 안 픽셀들의 중간값(median)을 배경(=뚜껑 표면) 색으로 삼음
+            Vec3b[] roiPixels = GetPixelsInMask(croppedLidBgr, roiMask);
+            if (roiPixels.Length == 0)
+            {
+                roiMask.Dispose();
+                return null;
+            }
+            double medianB = Median(roiPixels.Select(p => (double)p.Item0));
+            double medianG = Median(roiPixels.Select(p => (double)p.Item1));
+            double medianR = Median(roiPixels.Select(p => (double)p.Item2));
+
+            // [배경과의 색 거리 계산] 각 픽셀이 배경색이랑 얼마나 다른지(유클리드 거리)
+            Mat floatMat = new Mat();
+            croppedLidBgr.ConvertTo(floatMat, MatType.CV_32FC3);
+            Mat[] channels = Cv2.Split(floatMat);
+            Cv2.Subtract(channels[0], Scalar.All(medianB), channels[0]);
+            Cv2.Subtract(channels[1], Scalar.All(medianG), channels[1]);
+            Cv2.Subtract(channels[2], Scalar.All(medianR), channels[2]);
+            Cv2.Multiply(channels[0], channels[0], channels[0]);
+            Cv2.Multiply(channels[1], channels[1], channels[1]);
+            Cv2.Multiply(channels[2], channels[2], channels[2]);
+
+            Mat diffSquaredSum = new Mat();
+            Cv2.Add(channels[0], channels[1], diffSquaredSum);
+            Cv2.Add(diffSquaredSum, channels[2], diffSquaredSum);
+            Mat diff = new Mat();
+            Cv2.Sqrt(diffSquaredSum, diff);
+
+            // [원 바깥은 강제로 0(배경) 취급] - 절대 숫자로 안 잡히게
+            Mat roiInverted = new Mat();
+            Cv2.BitwiseNot(roiMask, roiInverted);
+            diff.SetTo(Scalar.All(0), roiInverted);
+
+            Cv2.MinMaxLoc(diff, out double minVal, out double maxVal);
+            Mat diffNormalized = new Mat();
+            diff.ConvertTo(diffNormalized, MatType.CV_8UC1, 255.0 / (maxVal + 1e-6));
+
+            // [가우시안 블러] 글리터 반짝임 노이즈 완화
+            Cv2.GaussianBlur(diffNormalized, diffNormalized, new OpenCvSharp.Size(5, 5), 0);
+
+            // [이진화] Otsu 자동 임계값
             Mat mask = new Mat();
+            Cv2.Threshold(diffNormalized, mask, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+            mask.SetTo(Scalar.All(0), roiInverted);
 
-            if (lidColor == "화이트")
+            // [모폴로지 열림] 자잘한 점 노이즈 제거 → [닫힘] 숫자 획 뭉치기
+            Mat openKernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new OpenCvSharp.Size(3, 3));
+            Cv2.MorphologyEx(mask, mask, MorphTypes.Open, openKernel);
+            Mat closeKernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new OpenCvSharp.Size(7, 7));
+            Cv2.MorphologyEx(mask, mask, MorphTypes.Close, closeKernel);
+
+            // [제일 큰 윤곽선 = 숫자] 찾아서 정사각형으로 크롭
+            OpenCvSharp.Point[] biggest = GetBiggestContour(mask);
+
+            Mat result = null;
+            if (biggest != null)
             {
-                // [변경] 고정값(90) 대신, 지금 뚜껑의 평균 밝기 대비 상대적으로 어두운 부분만 검정 숫자로 판단
-                Scalar overallMean = Cv2.Mean(hsv);
-                double avgVal = overallMean.Val2;
-                double darkThreshold = avgVal * 0.5;
-                Cv2.InRange(hsv, new Scalar(0, 0, 0), new Scalar(180, 255, darkThreshold), mask);
-            }
-            else if (lidColor == "파랑")
-            {
-                Cv2.InRange(hsv, new Scalar(15, 80, 80), new Scalar(35, 255, 255), mask);
-            }
-            else if (lidColor == "빨강")
-            {
-                Cv2.InRange(hsv, new Scalar(90, 80, 60), new Scalar(130, 255, 255), mask);
-            }
-            else
-            {
-                mask = Mat.Zeros(croppedLid.Size(), MatType.CV_8UC1);
+                Rect box = Cv2.BoundingRect(biggest);
+                if (box.Width > 0 && box.Height > 0)
+                {
+                    Mat digitCrop = new Mat(mask, box);
+                    int side = Math.Max(box.Width, box.Height);
+                    Mat padded = new Mat(side, side, MatType.CV_8UC1, Scalar.All(0));
+                    int yOffset = (side - box.Height) / 2;
+                    int xOffset = (side - box.Width) / 2;
+                    digitCrop.CopyTo(new Mat(padded, new Rect(xOffset, yOffset, box.Width, box.Height)));
+
+                    result = new Mat();
+                    Cv2.Resize(padded, result, new OpenCvSharp.Size(outSize, outSize), 0, 0, InterpolationFlags.Area);
+                    padded.Dispose();
+                    digitCrop.Dispose();
+                }
             }
 
-            // [신규] 모폴로지 닫힘(Closing) 연산 - 글리터 반짝이 때문에 자잘하게 쪼개진
-            // 흰 점들을 가까운 것끼리 뭉쳐서 숫자 하나가 매끈한 덩어리로 보이게 만듦
-            // (팽창(Dilate)으로 부풀려서 틈을 메운 다음, 침식(Erode)으로 다시 원래
-            //  크기로 줄이는 방식 - 크기는 거의 그대로 유지되면서 틈만 메워짐)
-            Mat kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new OpenCvSharp.Size(7, 7));
-            Cv2.MorphologyEx(mask, mask, MorphTypes.Close, kernel);
-            kernel.Dispose();
+            // [정리] 중간에 만든 임시 Mat들 다 해제 (메모리 누수 방지)
+            roiMask.Dispose();
+            roiInverted.Dispose();
+            floatMat.Dispose();
+            foreach (Mat ch in channels) ch.Dispose();
+            diffSquaredSum.Dispose();
+            diff.Dispose();
+            diffNormalized.Dispose();
+            mask.Dispose();
+            openKernel.Dispose();
+            closeKernel.Dispose();
 
-            hsv.Dispose();
-            return mask;
+            return result;
+        }
+
+        // [신규] 마스크(roiMask)가 255인 위치의 픽셀들만 배열로 뽑아주는 도우미 함수
+        private Vec3b[] GetPixelsInMask(Mat colorMat, Mat mask)
+        {
+            List<Vec3b> pixels = new List<Vec3b>();
+            for (int y = 0; y < colorMat.Rows; y++)
+            {
+                for (int x = 0; x < colorMat.Cols; x++)
+                {
+                    if (mask.At<byte>(y, x) == 255)
+                    {
+                        pixels.Add(colorMat.At<Vec3b>(y, x));
+                    }
+                }
+            }
+            return pixels.ToArray();
+        }
+
+        // [신규] 숫자들의 중간값(median)을 구해주는 도우미 함수
+        // (평균값은 이상치에 약한데, 중간값은 노이즈에 더 안정적이라 배경색 추정에 사용)
+        private double Median(IEnumerable<double> values)
+        {
+            List<double> sorted = values.OrderBy(v => v).ToList();
+            int count = sorted.Count;
+            if (count == 0) return 0;
+            if (count % 2 == 1)
+            {
+                return sorted[count / 2];
+            }
+            return (sorted[count / 2 - 1] + sorted[count / 2]) / 2.0;
+        }
+
+        // [신규] 전처리된 64x64 숫자 이미지를 CNN에 넣어서 1/2/3 중 뭔지 알아내는 함수
+        // 반환값: 예측된 숫자 문자열 ("1"/"2"/"3"), 모델이 없거나 실패하면 null
+        private string RunDigitInference(Mat digitPatch)
+        {
+            if (digitOnnxSession == null || digitLabelMap == null)
+            {
+                return null;
+            }
+
+            // [텐서 만들기] 모델 입력 형태 (배치1, 채널1, 높이64, 너비64), 0~1로 정규화
+            var inputTensor = new DenseTensor<float>(new[] { 1, 1, digitPatch.Rows, digitPatch.Cols });
+            for (int y = 0; y < digitPatch.Rows; y++)
+            {
+                for (int x = 0; x < digitPatch.Cols; x++)
+                {
+                    inputTensor[0, 0, y, x] = digitPatch.At<byte>(y, x) / 255f;
+                }
+            }
+
+            var inputs = new List<NamedOnnxValue>
+            {
+                NamedOnnxValue.CreateFromTensor("input", inputTensor)
+            };
+
+            using (var results = digitOnnxSession.Run(inputs))
+            {
+                float[] output = results.First().AsEnumerable<float>().ToArray();
+
+                // [argmax] 세 값(1일 확률, 2일 확률, 3일 확률) 중 제일 큰 것의 인덱스 찾기
+                int predictedIndex = 0;
+                float maxScore = output[0];
+                for (int i = 1; i < output.Length; i++)
+                {
+                    if (output[i] > maxScore)
+                    {
+                        maxScore = output[i];
+                        predictedIndex = i;
+                    }
+                }
+
+                return digitLabelMap[predictedIndex.ToString()];
+            }
         }
 
         // [신규] 뚜껑 색깔 판정 함수
+        // 뚜껑이 화면에 아예 없을 때, Otsu 이진화가 배경 자체의 미세한 밝기 차이를
+        // 억지로 갈라서 큰 덩어리를 "뚜껑"으로 오인하는 걸 막기 위해
+        // 인식된 영역이 적절한 범위(2~25%) 안에 있을 때만 진짜 뚜껑으로 인정함
+        // (실측: 빈 화면 46.2% / 진짜 뚜껑 4.8% - 카메라 시야가 뚜껑보다 훨씬 넓어서
+        //  진짜 물체가 있을 때 오히려 계산되는 비율이 작게 나옴)
+        private const double MinLidAreaRatioPercent = 2.0;
+        private const double MaxLidAreaRatioPercent = 25.0;
+
         private string ClassifyLidColor(Mat colorMat)
         {
             using (Mat gray = new Mat())
@@ -303,6 +580,12 @@ namespace CameraNumberDetect
                 int maskPixels = Cv2.CountNonZero(mask);
                 double maskRatio = (double)maskPixels / (mask.Rows * mask.Cols) * 100;
                 System.Diagnostics.Debug.WriteLine($"뚜껑으로 인식된 영역: {maskRatio:F1}%");
+
+                // [뚜껑 없음 판정] 범위를 벗어나면(너무 작거나, 너무 크면) 뚜껑이 아닐 가능성이 높음
+                if (maskRatio < MinLidAreaRatioPercent || maskRatio > MaxLidAreaRatioPercent)
+                {
+                    return "없음";
+                }
 
                 Cv2.CvtColor(colorMat, hsv, ColorConversionCodes.BGR2HSV);
                 Scalar meanHsv = Cv2.Mean(hsv, mask);
