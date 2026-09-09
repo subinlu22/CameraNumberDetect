@@ -8,7 +8,7 @@ using System.Text;                  // CSV 파일을 UTF-8로 저장할 때 필�
 using System.Text.Json;             // label_map.json 읽을 때 필요함
 using System.Threading;             // 영상을 계속 받아오는 작업을 별도 스레드로 돌리기 위해 필요함
 using System.Windows.Forms;
-using System.Runtime.InteropServices; // 비트맵 픽셀 데이터 직접 다룰 때 필요함 (한글 텍스트 그리기용)
+using System.Runtime.InteropServices; // 비트맵 픽셀 데이터 직접 다룰 때 필요함 (Mat→Bitmap 변환용)
 using Microsoft.ML.OnnxRuntime;         // ONNX 모델 불러와서 추론 실행하는 기능
 using Microsoft.ML.OnnxRuntime.Tensors; // 모델에 넣을 입력 데이터(텐서) 만드는 기능
 
@@ -65,9 +65,27 @@ namespace CameraNumberDetect
         const int stabilityThreshold = 5; // 이 프레임 수만큼 연속으로 같아야 "확실하다"고 보고 카운트함
         readonly string inspectionLogPath = Path.Combine(Application.StartupPath, "InspectionLog.csv");
 
+        // [신규] 대시보드 UI 컨트롤들 - 전부 코드에서 직접 생성 (디자이너 파일 안 건드림)
+        Panel panelInfo;
+        Panel panelCameraBorder; // pictureBox1을 감싸서 테두리 색으로 양품/불량 표시할 패널
+        Label lblResultHeader, lblResult, lblCaptureStatus;
+        Label lblStatsHeader, lblTotalCount, lblColorCounts, lblDigitCounts, lblCropHeader;
+        Label lblFilterHeader;
+        Button btnFilterWhite, btnFilterBlue, btnFilterRed, btnFilterAll;
+        PictureBox pictureBoxCrop;
+        Button btnExit; // [신규] 프로그램 종료 버튼
+
+        // [신규] 검사 기준(필터) - 이 색깔이 아니면 불량(빨간 테두리)으로 표시
+        // null이면 "전체 허용" 상태 (기준 없음, 중립 테두리)
+        string expectedLidColor = null;
+
         public Form1()
         {
             InitializeComponent();
+
+            // [신규] 대시보드 UI 구성 - OpenCV 창 대신 폼 안에 예쁘게 배치
+            BuildDashboardUi();
+
             SDKSystem.Initialize();
 
             // [신규] 숫자 인식 CNN 모델 불러오기 - 프로그램 켤 때 딱 한 번만 로딩
@@ -76,11 +94,223 @@ namespace CameraNumberDetect
             // [신규] 검사 기록 CSV 파일 준비 (없으면 헤더 줄과 함께 새로 만듦)
             InitializeInspectionLog();
 
+            // [신규] 키보드 입력을 폼이 직접 받도록 설정 (예전엔 OpenCV 창이 받았는데,
+            // 이제 OpenCV 창이 없어지니까 폼 자체에서 1/2/3 키를 받아야 함)
+            this.KeyPreview = true;
+            this.KeyDown += Form1_KeyDown;
+
             // [창 닫힐 때 정리 작업 등록]
             this.FormClosing += Form1_FormClosing;
 
             // [카메라 시작 시점] - 폼이 화면에 완전히 다 뜬 다음(Load 이벤트)에 실행
             this.Load += Form1_Load;
+        }
+
+        // [신규] 대시보드 UI를 코드로 직접 구성하는 함수
+        // (디자이너 파일을 직접 손대지 않고, 기존 pictureBox1만 재활용 + 나머지는 여기서 새로 추가)
+        private void BuildDashboardUi()
+        {
+            // [전체 창 설정] 고정 크기의 다크톤 대시보드
+            this.Text = "산업용카메라 검사 시스템";
+            this.ClientSize = new System.Drawing.Size(1200, 750);
+            this.FormBorderStyle = FormBorderStyle.FixedSingle;
+            this.MaximizeBox = false;
+            this.BackColor = System.Drawing.Color.FromArgb(30, 30, 30);
+
+            // [왼쪽 - 실시간 카메라 화면] pictureBox1을 테두리 패널 안에 넣어서
+            // 테두리 색깔로 양품(초록)/불량(빨강)을 직관적으로 보여줄 수 있게 함
+            panelCameraBorder = new Panel
+            {
+                Location = new System.Drawing.Point(20, 20),
+                Size = new System.Drawing.Size(760, 660),
+                BackColor = System.Drawing.Color.FromArgb(70, 70, 70), // 기본은 중립 회색
+            };
+            this.Controls.Add(panelCameraBorder);
+
+            pictureBox1.Parent = panelCameraBorder; // 기존 pictureBox1을 이 패널 안으로 옮김
+            pictureBox1.Location = new System.Drawing.Point(8, 8); // 8px 여백 = 테두리 두께
+            pictureBox1.Size = new System.Drawing.Size(744, 644);
+            pictureBox1.SizeMode = PictureBoxSizeMode.Zoom; // 비율 유지하면서 꽉 채움 (찌그러짐 방지)
+            pictureBox1.BackColor = System.Drawing.Color.Black;
+
+            // [오른쪽 - 정보 패널] 판정결과 + 통계 + 크롭 미리보기를 담을 카드
+            panelInfo = new Panel
+            {
+                Location = new System.Drawing.Point(800, 20),
+                Size = new System.Drawing.Size(360, 660),
+                BackColor = System.Drawing.Color.FromArgb(45, 45, 48),
+            };
+            this.Controls.Add(panelInfo);
+
+            // [신규] 검사 기준 설정 - 버튼 누르면 그 색깔만 "양품"으로 인정, 나머지는 불량 처리
+            lblFilterHeader = CreateLabel("검사 기준 설정", 10, 10, 12f, true, System.Drawing.Color.White);
+
+            btnFilterWhite = CreateFilterButton("화이트", 10, 35);
+            btnFilterBlue = CreateFilterButton("파랑", 97, 35);
+            btnFilterRed = CreateFilterButton("빨강", 184, 35);
+            btnFilterAll = CreateFilterButton("전체", 271, 35);
+
+            btnFilterWhite.Click += (s, e) => SetExpectedColor("화이트");
+            btnFilterBlue.Click += (s, e) => SetExpectedColor("파랑");
+            btnFilterRed.Click += (s, e) => SetExpectedColor("빨강");
+            btnFilterAll.Click += (s, e) => SetExpectedColor(null);
+
+            lblResultHeader = CreateLabel("판정 결과", 10, 85, 12f, true, System.Drawing.Color.White);
+
+            lblResult = CreateLabel("대기 중", 10, 115, 18f, true, System.Drawing.Color.LightGreen);
+            lblResult.Size = new System.Drawing.Size(340, 70);
+
+            lblCaptureStatus = CreateLabel("", 10, 195, 11f, true, System.Drawing.Color.OrangeRed);
+
+            lblStatsHeader = CreateLabel("오늘 통계", 10, 235, 12f, true, System.Drawing.Color.White);
+            lblTotalCount = CreateLabel("오늘 검사: 0건", 10, 270, 11f, false, System.Drawing.Color.Gainsboro);
+            lblColorCounts = CreateLabel("화이트 0   파랑 0   빨강 0", 10, 300, 11f, false, System.Drawing.Color.Gainsboro);
+            lblDigitCounts = CreateLabel("1번 0   2번 0   3번 0", 10, 330, 11f, false, System.Drawing.Color.Gainsboro);
+
+            lblCropHeader = CreateLabel("뚜껑 크롭 미리보기", 10, 375, 11f, true, System.Drawing.Color.White);
+
+            pictureBoxCrop = new PictureBox
+            {
+                Location = new System.Drawing.Point(10, 405),
+                Size = new System.Drawing.Size(340, 240),
+                SizeMode = PictureBoxSizeMode.Zoom,
+                BackColor = System.Drawing.Color.Black,
+                BorderStyle = BorderStyle.FixedSingle,
+            };
+
+            panelInfo.Controls.Add(lblFilterHeader);
+            panelInfo.Controls.Add(btnFilterWhite);
+            panelInfo.Controls.Add(btnFilterBlue);
+            panelInfo.Controls.Add(btnFilterRed);
+            panelInfo.Controls.Add(btnFilterAll);
+            panelInfo.Controls.Add(lblResultHeader);
+            panelInfo.Controls.Add(lblResult);
+            panelInfo.Controls.Add(lblCaptureStatus);
+            panelInfo.Controls.Add(lblStatsHeader);
+            panelInfo.Controls.Add(lblTotalCount);
+            panelInfo.Controls.Add(lblColorCounts);
+            panelInfo.Controls.Add(lblDigitCounts);
+            panelInfo.Controls.Add(lblCropHeader);
+            panelInfo.Controls.Add(pictureBoxCrop);
+
+            // [초기 상태] "전체" 선택된 상태로 시작 (기준 없음)
+            SetExpectedColor(null);
+
+            // [신규] 하단 종료 버튼 - X 버튼 대신 안전하게 종료할 수 있는 버튼
+            // (this.Close()를 호출하면 FormClosing 이벤트가 정상적으로 실행되면서 종료됨)
+            btnExit = new Button
+            {
+                Text = "프로그램 종료",
+                Location = new System.Drawing.Point(1090, 700),
+                Size = new System.Drawing.Size(110, 35),
+                Font = new System.Drawing.Font("맑은 고딕", 10f, System.Drawing.FontStyle.Bold),
+                ForeColor = System.Drawing.Color.White,
+                BackColor = System.Drawing.Color.FromArgb(150, 40, 40),
+                FlatStyle = FlatStyle.Flat,
+            };
+            btnExit.Click += (s, e) => this.Close();
+            this.Controls.Add(btnExit);
+        }
+
+        // [신규] 검사 기준 버튼 하나 만드는 도우미 함수
+        private Button CreateFilterButton(string text, int x, int y)
+        {
+            return new Button
+            {
+                Text = text,
+                Location = new System.Drawing.Point(x, y),
+                Size = new System.Drawing.Size(79, 32),
+                Font = new System.Drawing.Font("맑은 고딕", 9f, System.Drawing.FontStyle.Bold),
+                ForeColor = System.Drawing.Color.White,
+                BackColor = System.Drawing.Color.FromArgb(60, 60, 60),
+                FlatStyle = FlatStyle.Flat,
+            };
+        }
+
+        // [신규] 검사 기준(필터) 색깔을 바꾸고, 버튼 강조 표시도 같이 갱신하는 함수
+        private void SetExpectedColor(string color)
+        {
+            expectedLidColor = color;
+
+            System.Drawing.Color selectedColor = System.Drawing.Color.FromArgb(90, 90, 200); // 선택된 버튼 강조색
+            System.Drawing.Color normalColor = System.Drawing.Color.FromArgb(60, 60, 60);     // 평상시 버튼색
+
+            btnFilterWhite.BackColor = (color == "화이트") ? selectedColor : normalColor;
+            btnFilterBlue.BackColor = (color == "파랑") ? selectedColor : normalColor;
+            btnFilterRed.BackColor = (color == "빨강") ? selectedColor : normalColor;
+            btnFilterAll.BackColor = (color == null) ? selectedColor : normalColor;
+        }
+
+        // [신규] 라벨 하나 만드는 반복 작업을 줄여주는 도우미 함수
+        private Label CreateLabel(string text, int x, int y, float fontSize, bool bold, System.Drawing.Color color)
+        {
+            return new Label
+            {
+                Text = text,
+                Location = new System.Drawing.Point(x, y),
+                AutoSize = false,
+                Size = new System.Drawing.Size(340, 25),
+                Font = new System.Drawing.Font("맑은 고딕", fontSize,
+                    bold ? System.Drawing.FontStyle.Bold : System.Drawing.FontStyle.Regular),
+                ForeColor = color,
+                BackColor = System.Drawing.Color.Transparent,
+            };
+        }
+
+        // [신규] 백그라운드 스레드(ReceiveThreadProcess)에서 UI 컨트롤을 안전하게 갱신하기 위한 도우미
+        // (WinForms는 UI 컨트롤을 만든 스레드가 아닌 다른 스레드에서 직접 건드리면 안 되는 규칙이 있음)
+        // [중요] Invoke(동기, 결과 나올 때까지 기다림) 대신 BeginInvoke(비동기, 던져놓고 바로 넘어감)를 씀.
+        // Invoke를 쓰면 "창 닫기 눌러서 UI 스레드가 receiveThread.Join()으로 기다리는 중" +
+        // "receiveThread는 Invoke로 UI 스레드가 처리해주길 기다리는 중"이 동시에 벌어져서
+        // 서로가 서로를 기다리는 교착상태(deadlock)로 프로그램이 멈춰버리는 문제가 있었음
+        private void UpdateUi(Action action)
+        {
+            if (this.IsHandleCreated && !this.IsDisposed)
+            {
+                try
+                {
+                    this.BeginInvoke(action);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // 폼이 막 닫히는 중이면 그냥 무시 (프로그램 종료 시점의 정상적인 상황)
+                }
+                catch (InvalidOperationException)
+                {
+                    // 폼 핸들이 이미 파괴된 상태에서 호출된 경우도 무시
+                }
+            }
+        }
+
+        // [신규] 키보드 1/2/3 - 자동촬영 토글 (예전엔 OpenCV 창의 Cv2.WaitKey가 받던 걸
+        // 이제 OpenCV 창이 없어져서 폼 자체의 키 이벤트로 옮김)
+        private void Form1_KeyDown(object sender, KeyEventArgs e)
+        {
+            string pressedDigit = null;
+            if (e.KeyCode == Keys.D1 || e.KeyCode == Keys.NumPad1) pressedDigit = "1";
+            else if (e.KeyCode == Keys.D2 || e.KeyCode == Keys.NumPad2) pressedDigit = "2";
+            else if (e.KeyCode == Keys.D3 || e.KeyCode == Keys.NumPad3) pressedDigit = "3";
+
+            if (pressedDigit == null)
+            {
+                return;
+            }
+
+            if (isAutoCapturing && captureDigit == pressedDigit)
+            {
+                // 같은 숫자키를 다시 누름 → 촬영 종료
+                isAutoCapturing = false;
+                System.Diagnostics.Debug.WriteLine($"자동촬영 종료: 숫자{captureDigit}, 총 {captureSavedCount}장 저장됨");
+            }
+            else
+            {
+                // 새로 시작 (다른 숫자를 누른 경우 - 이전 숫자 촬영은 중단하고 새 숫자로 전환)
+                isAutoCapturing = true;
+                captureDigit = pressedDigit;
+                captureFrameCounter = 0;
+                captureSavedCount = 0;
+                System.Diagnostics.Debug.WriteLine($"자동촬영 시작: 숫자{captureDigit}");
+            }
         }
 
         // [신규] digit_cnn.onnx + label_map.json을 불러와서 준비해두는 함수
@@ -143,71 +373,36 @@ namespace CameraNumberDetect
             OpenCameraAndStartGrab();
         }
 
-        // [신규] OpenCV의 Cv2.PutText는 한글을 못 그리는 한계가 있어서(Hershey 폰트에
-        // 한글 글자 모양 자체가 없음), 대신 윈도우 System.Drawing으로 한글 텍스트를
-        // 그린 다음 그 결과만 이미지 위에 얹는 방식으로 우회하는 함수.
-        // color 파라미터는 OpenCV 스타일(B,G,R 순서)의 Scalar를 그대로 받음
-        private void PutKoreanText(Mat img, string text, System.Drawing.Point origin, float fontSizePt, Scalar color)
+        // [신규] OpenCV Mat을 화면(PictureBox)에 표시할 수 있는 Bitmap으로 변환하는 함수
+        // (한 줄씩 그대로 복사하는 방식이라 색이 안 틀어지고 빠름 - Mat은 BGR 3채널이어야 함)
+        private System.Drawing.Bitmap MatToBitmap(Mat mat)
         {
-            // [1단계] 글자가 그려질 정확한 크기를 먼저 재봄 (너무 작으면 잘리고, 너무 크면 낭비니까)
-            System.Drawing.SizeF measuredSize;
-            using (var measureBmp = new System.Drawing.Bitmap(1, 1))
-            using (var measureG = System.Drawing.Graphics.FromImage(measureBmp))
-            using (var measureFont = new System.Drawing.Font("맑은 고딕", fontSizePt, System.Drawing.FontStyle.Bold))
+            int width = mat.Cols;
+            int height = mat.Rows;
+
+            var bitmap = new System.Drawing.Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            var bmpData = bitmap.LockBits(
+                new System.Drawing.Rectangle(0, 0, width, height),
+                System.Drawing.Imaging.ImageLockMode.WriteOnly,
+                System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+
+            int matStep = (int)mat.Step();
+            int rowBytes = width * 3;
+            IntPtr matDataPtr = mat.Data;
+            byte[] rowBuffer = new byte[rowBytes];
+
+            // [한 줄씩 복사] Mat이랑 Bitmap이 한 줄(row)당 차지하는 바이트 수(step/stride)가
+            // 다를 수 있어서, 통째로 한 번에 복사하지 않고 줄 단위로 나눠서 복사함
+            for (int y = 0; y < height; y++)
             {
-                measuredSize = measureG.MeasureString(text, measureFont);
+                IntPtr srcRow = IntPtr.Add(matDataPtr, y * matStep);
+                IntPtr dstRow = IntPtr.Add(bmpData.Scan0, y * bmpData.Stride);
+                Marshal.Copy(srcRow, rowBuffer, 0, rowBytes);
+                Marshal.Copy(rowBuffer, 0, dstRow, rowBytes);
             }
 
-            int bmpWidth = (int)Math.Ceiling(measuredSize.Width) + 4;
-            int bmpHeight = (int)Math.Ceiling(measuredSize.Height) + 4;
-
-            // [2단계] 투명 배경 비트맵에 흰색으로 텍스트만 그림
-            // (실제 색은 나중에 입힐 거라, 여기서는 "글자가 있는 위치"만 알면 됨)
-            using (var bmp = new System.Drawing.Bitmap(bmpWidth, bmpHeight, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
-            {
-                using (var g = System.Drawing.Graphics.FromImage(bmp))
-                using (var font = new System.Drawing.Font("맑은 고딕", fontSizePt, System.Drawing.FontStyle.Bold))
-                using (var brush = new System.Drawing.SolidBrush(System.Drawing.Color.White))
-                {
-                    g.Clear(System.Drawing.Color.Transparent);
-                    g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
-                    g.DrawString(text, font, brush, 2, 2);
-                }
-
-                // [3단계] 비트맵 픽셀을 직접 읽어서, 글자가 그려진(알파값 있는) 부분만
-                // 원하는 색으로 이미지 위에 찍음 (배경은 그대로 안 건드림)
-                var bmpData = bmp.LockBits(
-                    new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height),
-                    System.Drawing.Imaging.ImageLockMode.ReadOnly,
-                    System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-
-                int stride = bmpData.Stride;
-                byte[] pixelData = new byte[stride * bmp.Height];
-                Marshal.Copy(bmpData.Scan0, pixelData, 0, pixelData.Length);
-                bmp.UnlockBits(bmpData);
-
-                Vec3b drawColor = new Vec3b((byte)color.Val0, (byte)color.Val1, (byte)color.Val2);
-
-                for (int y = 0; y < bmp.Height; y++)
-                {
-                    int imgY = origin.Y + y;
-                    if (imgY < 0 || imgY >= img.Rows) continue;
-
-                    for (int x = 0; x < bmp.Width; x++)
-                    {
-                        int imgX = origin.X + x;
-                        if (imgX < 0 || imgX >= img.Cols) continue;
-
-                        // [Format32bppArgb 메모리 순서] 픽셀당 4바이트: B, G, R, A 순서
-                        int idx = y * stride + x * 4;
-                        byte alpha = pixelData[idx + 3];
-                        if (alpha > 50) // 글자 안쪽(불투명한 부분)만 색칠
-                        {
-                            img.Set(imgY, imgX, drawColor);
-                        }
-                    }
-                }
-            }
+            bitmap.UnlockBits(bmpData);
+            return bitmap;
         }
 
         // [신규] 마스크(흰색 영역) 안에서 제일 큰 윤곽선 하나만 뽑아주는 공용 함수
@@ -335,6 +530,11 @@ namespace CameraNumberDetect
                     string lidColor = ClassifyLidColor(displayMat);
                     System.Diagnostics.Debug.WriteLine("판정된 색깔: " + lidColor);
 
+                    // [화면에 표시할 텍스트들] 이번 프레임에서 뭘 보여줄지 미리 준비해뒀다가
+                    // 마지막에 한 번에 UI 스레드로 넘겨서 갱신함
+                    string autoCaptureStatusText = "";
+                    string resultText = "대기 중 (뚜껑을 카메라 앞에 놓아주세요)";
+
                     using (Mat croppedLid = CropLidArea(displayMat))
                     {
                         // [신규] 자동촬영 중이면 - 몇 프레임마다 한 장씩 크롭된 뚜껑 이미지를 저장
@@ -348,9 +548,7 @@ namespace CameraNumberDetect
                                 SaveTrainingImage(croppedLid, lidColor, captureDigit);
                             }
 
-                            // [화면 표시] 지금 촬영 중이라는 걸 빨간 글씨로 표시 - 콘솔 안 봐도 바로 알 수 있게
-                            string overlayText = $"자동촬영 중: 숫자{captureDigit} ({captureSavedCount}장)";
-                            PutKoreanText(displayMat, overlayText, new System.Drawing.Point(10, 10), 20f, new Scalar(0, 0, 255));
+                            autoCaptureStatusText = $"● 자동촬영 중: 숫자{captureDigit} ({captureSavedCount}장)";
                         }
 
                         // [신규] CNN으로 숫자 판정 - 전처리 → 추론 → 뚜껑색/숫자색/숫자 합쳐서 화면에 표시
@@ -365,11 +563,7 @@ namespace CameraNumberDetect
                                     if (predictedDigit != null && lidToDigitColorMap.ContainsKey(lidColor))
                                     {
                                         string digitColor = lidToDigitColorMap[lidColor];
-                                        string resultText = $"{lidColor} 뚜껑, {digitColor} 숫자 {predictedDigit}";
-
-                                        // [화면 표시] 판정 결과는 초록색 글씨로 (자동촬영 빨간 글씨 아래쪽에)
-                                        // - 이 표시는 매 프레임 즉시 보여줌 (카운트 확정 여부와 무관하게)
-                                        PutKoreanText(displayMat, resultText, new System.Drawing.Point(10, 45), 20f, new Scalar(0, 255, 0));
+                                        resultText = $"{lidColor} 뚜껑\n{digitColor} 숫자 {predictedDigit}";
 
                                         // [신규] 중복집계 방지 - "지금 조합이 후보랑 같은가" 확인
                                         string detectionKey = $"{lidColor}_{digitColor}_{predictedDigit}";
@@ -403,39 +597,49 @@ namespace CameraNumberDetect
                             candidateStableFrames = 0;
                         }
 
-                        // [신규] 관제용 통계 표시 - 화면 하단에 노란 글씨로 오늘 검사 수 + 색깔/숫자별 수량
-                        string statsText =
-                            $"오늘 검사: {totalInspectedCount}건\n" +
-                            $"화이트 {colorCounts["화이트"]}  파랑 {colorCounts["파랑"]}  빨강 {colorCounts["빨강"]}\n" +
-                            $"1번 {digitCounts["1"]}  2번 {digitCounts["2"]}  3번 {digitCounts["3"]}";
-                        PutKoreanText(displayMat, statsText, new System.Drawing.Point(10, displayMat.Rows - 130), 18f, new Scalar(0, 255, 255));
+                        // [신규] Mat → Bitmap 변환은 Mat이 아직 살아있는(Dispose 되기 전) 이 시점에서 해야 함
+                        System.Drawing.Bitmap mainBitmap = MatToBitmap(displayMat);
+                        System.Drawing.Bitmap cropBitmap = MatToBitmap(croppedLid);
 
-                        Cv2.ImShow("뚜껑 크롭 확인", croppedLid);
-                    }
+                        string statsTotalText = $"오늘 검사: {totalInspectedCount}건";
+                        string statsColorText = $"화이트 {colorCounts["화이트"]}   파랑 {colorCounts["파랑"]}   빨강 {colorCounts["빨강"]}";
+                        string statsDigitText = $"1번 {digitCounts["1"]}   2번 {digitCounts["2"]}   3번 {digitCounts["3"]}";
 
-                    Cv2.ImShow("OpenCV 테스트", displayMat);
-
-                    // [신규] 키 1/2/3 - 자동촬영 토글 (같은 키 다시 누르면 중지)
-                    int key = Cv2.WaitKey(1);
-                    if (key == '1' || key == '2' || key == '3')
-                    {
-                        string pressedDigit = ((char)key).ToString();
-
-                        if (isAutoCapturing && captureDigit == pressedDigit)
+                        // [신규] 검사 기준(필터)이랑 비교해서 테두리 색 결정
+                        // - 뚜껑이 없거나 기준이 "전체"면 중립 회색
+                        // - 기준 색깔이랑 일치하면 초록(양품), 다르면 빨강(불량)
+                        System.Drawing.Color borderColor;
+                        if (lidColor == "없음" || expectedLidColor == null)
                         {
-                            // 같은 숫자키를 다시 누름 → 촬영 종료
-                            isAutoCapturing = false;
-                            System.Diagnostics.Debug.WriteLine($"자동촬영 종료: 숫자{captureDigit}, 총 {captureSavedCount}장 저장됨");
+                            borderColor = System.Drawing.Color.FromArgb(70, 70, 70);
+                        }
+                        else if (lidColor == expectedLidColor)
+                        {
+                            borderColor = System.Drawing.Color.LimeGreen;
                         }
                         else
                         {
-                            // 새로 시작 (다른 숫자를 누른 경우 - 이전 숫자 촬영은 중단하고 새 숫자로 전환)
-                            isAutoCapturing = true;
-                            captureDigit = pressedDigit;
-                            captureFrameCounter = 0;
-                            captureSavedCount = 0;
-                            System.Diagnostics.Debug.WriteLine($"자동촬영 시작: 숫자{captureDigit}");
+                            borderColor = System.Drawing.Color.Red;
                         }
+
+                        // [신규] 실제 화면 갱신은 전부 UI 스레드에서 한 번에 처리
+                        UpdateUi(() =>
+                        {
+                            var oldMain = pictureBox1.Image;
+                            pictureBox1.Image = mainBitmap;
+                            oldMain?.Dispose();
+
+                            var oldCrop = pictureBoxCrop.Image;
+                            pictureBoxCrop.Image = cropBitmap;
+                            oldCrop?.Dispose();
+
+                            lblResult.Text = resultText;
+                            lblCaptureStatus.Text = autoCaptureStatusText;
+                            lblTotalCount.Text = statsTotalText;
+                            lblColorCounts.Text = statsColorText;
+                            lblDigitCounts.Text = statsDigitText;
+                            panelCameraBorder.BackColor = borderColor;
+                        });
                     }
 
                     displayMat.Dispose();
@@ -714,7 +918,9 @@ namespace CameraNumberDetect
                 receiveThread.Join();
             }
 
-            Cv2.DestroyAllWindows();
+            // [신규] PictureBox에 남아있는 이미지 리소스 정리 (OpenCV 창은 이제 없어서 DestroyAllWindows 불필요)
+            pictureBox1.Image?.Dispose();
+            pictureBoxCrop.Image?.Dispose();
 
             if (device != null)
             {
