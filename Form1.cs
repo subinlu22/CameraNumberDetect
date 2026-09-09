@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;   // 카메라 목록을 담을 List<> 쓰려고 필요함
 using System.IO;                    // 학습용 이미지 저장/폴더 생성 위해 필요함
 using System.Linq;                  // 배열에서 제일 큰 값의 위치 찾을 때(argmax) 필요함
+using System.Text;                  // CSV 파일을 UTF-8로 저장할 때 필요함
 using System.Text.Json;             // label_map.json 읽을 때 필요함
 using System.Threading;             // 영상을 계속 받아오는 작업을 별도 스레드로 돌리기 위해 필요함
 using System.Windows.Forms;
@@ -42,6 +43,28 @@ namespace CameraNumberDetect
             { "빨강", "파랑" },
         };
 
+        // [신규] 관제(카운트) 관련 상태값들
+        int totalInspectedCount = 0;   // 오늘 총 검사 수
+        readonly Dictionary<string, int> colorCounts = new Dictionary<string, int>
+        {
+            { "화이트", 0 }, { "파랑", 0 }, { "빨강", 0 },
+        };
+        readonly Dictionary<string, int> digitCounts = new Dictionary<string, int>
+        {
+            { "1", 0 }, { "2", 0 }, { "3", 0 },
+        };
+        // [중복집계 방지 - 재설계] 시간(프레임 수)으로 판단하는 대신,
+        // "지금 결과가 방금 전 카운트한 조합이랑 다른가"로 판단하는 방식.
+        // - 같은 뚜껑이 계속 있거나, 손이 잠깐 지나갔다 같은 뚜껑으로 돌아오면 → lastCountedKey랑
+        //   똑같으니까 중복 카운트 안 됨
+        // - 다른 뚜껑으로 바뀌면 → 조합이 달라지니까 대기시간 없이 바로 새로 카운트됨
+        //   (뚜껑을 빠르게 바꿔치기해도 안전하게 작동)
+        string lastCountedKey = null;     // 마지막으로 카운트했던 조합 ("화이트_검정_2" 이런 식)
+        string candidateKey = null;       // 지금 후보로 보이고 있는 조합
+        int candidateStableFrames = 0;    // 그 후보가 몇 프레임 연속으로 똑같이 나왔는지
+        const int stabilityThreshold = 5; // 이 프레임 수만큼 연속으로 같아야 "확실하다"고 보고 카운트함
+        readonly string inspectionLogPath = Path.Combine(Application.StartupPath, "InspectionLog.csv");
+
         public Form1()
         {
             InitializeComponent();
@@ -49,6 +72,9 @@ namespace CameraNumberDetect
 
             // [신규] 숫자 인식 CNN 모델 불러오기 - 프로그램 켤 때 딱 한 번만 로딩
             LoadDigitOnnxModel();
+
+            // [신규] 검사 기록 CSV 파일 준비 (없으면 헤더 줄과 함께 새로 만듦)
+            InitializeInspectionLog();
 
             // [창 닫힐 때 정리 작업 등록]
             this.FormClosing += Form1_FormClosing;
@@ -81,6 +107,34 @@ namespace CameraNumberDetect
                 MessageBox.Show("숫자 인식 모델(digit_cnn.onnx) 로딩 실패: " + ex.Message +
                     "\n\ndigit_cnn.onnx, label_map.json 파일이 실행파일과 같은 폴더에 있는지 확인해줘.");
             }
+        }
+
+        // [신규] 검사 기록용 CSV 파일 준비 - 파일이 없으면 헤더 줄과 함께 새로 만듦
+        // (있으면 그대로 두고 이어서 씀 - 프로그램 껐다 켜도 기록이 계속 쌓이게)
+        private void InitializeInspectionLog()
+        {
+            if (!File.Exists(inspectionLogPath))
+            {
+                File.WriteAllText(inspectionLogPath, "시간,뚜껑색,숫자색,숫자\n", Encoding.UTF8);
+            }
+        }
+
+        // [신규] 카운트 1건 추가 + CSV에 한 줄 기록하는 함수
+        // (같은 뚜껑 중복집계 방지 체크는 호출하는 쪽(ReceiveThreadProcess)에서 이미 하고 옴)
+        private void RecordInspection(string lidColor, string digitColor, string digit)
+        {
+            totalInspectedCount++;
+            if (colorCounts.ContainsKey(lidColor))
+            {
+                colorCounts[lidColor]++;
+            }
+            if (digitCounts.ContainsKey(digit))
+            {
+                digitCounts[digit]++;
+            }
+
+            string logLine = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss},{lidColor},{digitColor},{digit}\n";
+            File.AppendAllText(inspectionLogPath, logLine, Encoding.UTF8);
         }
 
         // ch: 폼이 화면에 완전히 뜬 직후 자동으로 실행되는 함수
@@ -314,11 +368,47 @@ namespace CameraNumberDetect
                                         string resultText = $"{lidColor} 뚜껑, {digitColor} 숫자 {predictedDigit}";
 
                                         // [화면 표시] 판정 결과는 초록색 글씨로 (자동촬영 빨간 글씨 아래쪽에)
+                                        // - 이 표시는 매 프레임 즉시 보여줌 (카운트 확정 여부와 무관하게)
                                         PutKoreanText(displayMat, resultText, new System.Drawing.Point(10, 45), 20f, new Scalar(0, 255, 0));
+
+                                        // [신규] 중복집계 방지 - "지금 조합이 후보랑 같은가" 확인
+                                        string detectionKey = $"{lidColor}_{digitColor}_{predictedDigit}";
+                                        if (detectionKey == candidateKey)
+                                        {
+                                            candidateStableFrames++;
+                                        }
+                                        else
+                                        {
+                                            candidateKey = detectionKey;
+                                            candidateStableFrames = 1;
+                                        }
+
+                                        // [카운트 확정] 몇 프레임 연속으로 안정적으로 같은 결과가 나왔고,
+                                        // 그게 마지막으로 카운트했던 조합이랑 다르면 → 새 물체로 인정하고 카운트
+                                        if (candidateStableFrames >= stabilityThreshold && detectionKey != lastCountedKey)
+                                        {
+                                            RecordInspection(lidColor, digitColor, predictedDigit);
+                                            lastCountedKey = detectionKey;
+                                        }
                                     }
                                 }
                             }
                         }
+                        else
+                        {
+                            // [신규] 뚜껑이 안 보이는 동안은 후보만 리셋 (손 지나감이든 진짜 치움이든 상관없음)
+                            // lastCountedKey는 그대로 유지 - 손 지나갔다 같은 뚜껑으로 돌아오면
+                            // 다시 candidateKey를 새로 쌓아야 하지만, lastCountedKey랑 같아서 재카운트는 안 됨
+                            candidateKey = null;
+                            candidateStableFrames = 0;
+                        }
+
+                        // [신규] 관제용 통계 표시 - 화면 하단에 노란 글씨로 오늘 검사 수 + 색깔/숫자별 수량
+                        string statsText =
+                            $"오늘 검사: {totalInspectedCount}건\n" +
+                            $"화이트 {colorCounts["화이트"]}  파랑 {colorCounts["파랑"]}  빨강 {colorCounts["빨강"]}\n" +
+                            $"1번 {digitCounts["1"]}  2번 {digitCounts["2"]}  3번 {digitCounts["3"]}";
+                        PutKoreanText(displayMat, statsText, new System.Drawing.Point(10, displayMat.Rows - 130), 18f, new Scalar(0, 255, 255));
 
                         Cv2.ImShow("뚜껑 크롭 확인", croppedLid);
                     }
