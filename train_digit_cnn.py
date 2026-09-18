@@ -87,8 +87,17 @@ def extract_digit_patch(image_bgr, out_size=IMAGE_SIZE):
     pixels_in_roi = img[roi_mask == 255]
     bg_color = np.median(pixels_in_roi, axis=0)
 
+    # [신규] 색 거리 계산 "전에" 먼저 블러 처리 - 글리터 반짝임 노이즈를 미리 주변
+    # 픽셀과 섞어서 완화함. 아래에 있던 블러(diff_normalized에 적용하는 것)는
+    # 반짝이는 픽셀이 이미 극단적인 값을 만들어놓은 "뒤"라서 이미 늦은 시점이었음
+    # ⚠️ C# 쪽 ExtractDigitPatchForCnn에도 커널 크기(7,7) 반드시 동일하게 적용됨 -
+    #    학습(파이썬)과 추론(C#) 전처리가 한 글자도 다르면 안 되니 커널 크기 맞출 것
+    blurred_for_diff = cv2.GaussianBlur(img, (7, 7), 0)
+
     # [배경과의 색 거리 계산] 각 픽셀이 배경색이랑 얼마나 다른지(유클리드 거리)
-    diff = np.linalg.norm(img - bg_color, axis=2)
+    # (bg_color는 원본 img 기준 median 그대로 사용 - 배경색 추정 자체는 안 건드림,
+    #  거리 계산에 쓰는 이미지만 블러된 버전으로 교체)
+    diff = np.linalg.norm(blurred_for_diff - bg_color, axis=2)
     diff[roi_mask == 0] = 0  # 원 바깥(귀퉁이)은 강제로 "배경"(0) 취급 - 절대 숫자로 안 잡히게
 
     diff_normalized = (diff / (diff.max() + 1e-6) * 255).astype(np.uint8)

@@ -23,6 +23,20 @@ namespace CameraNumberDetect
         bool isGrabbing = false;        // "지금 영상을 계속 받아오고 있는 중인가?" 스위치
         Thread receiveThread = null;    // 영상을 계속 받아오는 작업을 담당할 별도 스레드
 
+        // [신규] 분석 대상 영역(ROI) 관련 - 화면 양쪽 가장자리에 컨베이어벨트 금속 레일이 있어서
+        // 배경 학습 마스크에서도 이 구간은 아예 제외하고 분석함
+        private const double RoiLeftMarginPercent = 25.0;
+        private const double RoiRightMarginPercent = 25.0;
+
+        // [신규] 배경 학습(BackgroundSubtractorMOG2) 관련 상태값들
+        // - 벨트 자체가 계속 움직이면서 짜임 무늬가 스크롤되듯 지나가는 상황이라,
+        //   짧게 학습하면 "매번 새로운 무늬가 나타난다"고 착각함 - 충분히 오래(여러 바퀴) 학습시켜야
+        //   "이 자리는 원래 이렇게 반복적으로 밝아졌다 어두워졌다 한다"는 패턴을 제대로 익힘
+        // - 그래서 고정된 시간이 아니라, 버튼으로 직접 시작/종료를 조절할 수 있게 함
+        BackgroundSubtractorMOG2 bgSubtractor = null;
+        bool isBackgroundLearning = false;
+        System.Diagnostics.Stopwatch backgroundLearningStopwatch;
+
         // [신규] 자동촬영(학습 데이터 수집) 관련 상태값들
         bool isAutoCapturing = false;           // "지금 자동촬영 중인가?" 스위치
         string captureDigit = "";               // 지금 촬영 중인 숫자 ("1","2","3")
@@ -70,10 +84,14 @@ namespace CameraNumberDetect
         Panel panelCameraBorder; // pictureBox1을 감싸서 테두리 색으로 양품/불량 표시할 패널
         Label lblResultHeader, lblResult, lblCaptureStatus;
         Label lblStatsHeader, lblTotalCount, lblColorCounts, lblDigitCounts, lblCropHeader;
+        Label lblDigitPatchHeader; // [신규] CNN 입력 미리보기 라벨
         Label lblFilterHeader;
         Button btnFilterWhite, btnFilterBlue, btnFilterRed, btnFilterAll;
         PictureBox pictureBoxCrop;
+        PictureBox pictureBoxDigitPatch; // [신규] CNN이 실제로 보는 64x64 입력 이미지 미리보기
         Button btnExit; // [신규] 프로그램 종료 버튼
+        Button btnLearnBackground; // [신규] 배경 학습 시작/종료 버튼
+        Button btnResetCount; // [신규] 오늘 통계(카운트) 리셋 버튼
 
         // [신규] 검사 기준(필터) - 이 색깔이 아니면 불량(빨간 테두리)으로 표시
         // null이면 "전체 허용" 상태 (기준 없음, 중립 테두리)
@@ -112,7 +130,8 @@ namespace CameraNumberDetect
         {
             // [전체 창 설정] 고정 크기의 다크톤 대시보드
             this.Text = "산업용카메라 검사 시스템";
-            this.ClientSize = new System.Drawing.Size(1200, 750);
+            this.ClientSize = new System.Drawing.Size(1200, 700);
+            this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
             this.BackColor = System.Drawing.Color.FromArgb(30, 30, 30);
@@ -122,14 +141,14 @@ namespace CameraNumberDetect
             panelCameraBorder = new Panel
             {
                 Location = new System.Drawing.Point(20, 20),
-                Size = new System.Drawing.Size(760, 660),
+                Size = new System.Drawing.Size(760, 610),
                 BackColor = System.Drawing.Color.FromArgb(70, 70, 70), // 기본은 중립 회색
             };
             this.Controls.Add(panelCameraBorder);
 
             pictureBox1.Parent = panelCameraBorder; // 기존 pictureBox1을 이 패널 안으로 옮김
             pictureBox1.Location = new System.Drawing.Point(8, 8); // 8px 여백 = 테두리 두께
-            pictureBox1.Size = new System.Drawing.Size(744, 644);
+            pictureBox1.Size = new System.Drawing.Size(744, 594);
             pictureBox1.SizeMode = PictureBoxSizeMode.Zoom; // 비율 유지하면서 꽉 채움 (찌그러짐 방지)
             pictureBox1.BackColor = System.Drawing.Color.Black;
 
@@ -137,7 +156,7 @@ namespace CameraNumberDetect
             panelInfo = new Panel
             {
                 Location = new System.Drawing.Point(800, 20),
-                Size = new System.Drawing.Size(360, 660),
+                Size = new System.Drawing.Size(360, 610),
                 BackColor = System.Drawing.Color.FromArgb(45, 45, 48),
             };
             this.Controls.Add(panelInfo);
@@ -163,16 +182,44 @@ namespace CameraNumberDetect
             lblCaptureStatus = CreateLabel("", 10, 195, 11f, true, System.Drawing.Color.OrangeRed);
 
             lblStatsHeader = CreateLabel("오늘 통계", 10, 235, 12f, true, System.Drawing.Color.White);
+
+            // [신규] 통계 리셋 버튼 - 오늘 통계 헤더 옆에 작게 배치
+            btnResetCount = new Button
+            {
+                Text = "리셋",
+                Location = new System.Drawing.Point(280, 231),
+                Size = new System.Drawing.Size(60, 24),
+                Font = new System.Drawing.Font("맑은 고딕", 9f),
+                ForeColor = System.Drawing.Color.White,
+                BackColor = System.Drawing.Color.FromArgb(70, 70, 70),
+                FlatStyle = FlatStyle.Flat,
+            };
+            btnResetCount.Click += (s, e) => ResetCounts();
+
             lblTotalCount = CreateLabel("오늘 검사: 0건", 10, 270, 11f, false, System.Drawing.Color.Gainsboro);
             lblColorCounts = CreateLabel("화이트 0   파랑 0   빨강 0", 10, 300, 11f, false, System.Drawing.Color.Gainsboro);
             lblDigitCounts = CreateLabel("1번 0   2번 0   3번 0", 10, 330, 11f, false, System.Drawing.Color.Gainsboro);
 
             lblCropHeader = CreateLabel("뚜껑 크롭 미리보기", 10, 375, 11f, true, System.Drawing.Color.White);
+            lblDigitPatchHeader = CreateLabel("CNN 입력", 250, 375, 11f, true, System.Drawing.Color.White);
 
             pictureBoxCrop = new PictureBox
             {
                 Location = new System.Drawing.Point(10, 405),
-                Size = new System.Drawing.Size(340, 240),
+                Size = new System.Drawing.Size(230, 150),
+                SizeMode = PictureBoxSizeMode.Zoom,
+                BackColor = System.Drawing.Color.Black,
+                BorderStyle = BorderStyle.FixedSingle,
+            };
+
+            // [신규] CNN이 실제로 입력받는 64x64 흑백 이미지를 그대로 보여주는 미리보기
+            // - 여기서 숫자 모양이 제대로 보이면 추출은 잘 된 것 → 모델(재학습) 쪽 문제
+            // - 여기서부터 이미 뭉개져 있으면 추출 과정(ExtractDigitPatchForCnn) 쪽 문제
+            // (크롭 미리보기 옆에 나란히 배치 - 세로로 쌓으면 패널 높이를 넘어가서 화면에 안 잡힘)
+            pictureBoxDigitPatch = new PictureBox
+            {
+                Location = new System.Drawing.Point(250, 405),
+                Size = new System.Drawing.Size(90, 90),
                 SizeMode = PictureBoxSizeMode.Zoom,
                 BackColor = System.Drawing.Color.Black,
                 BorderStyle = BorderStyle.FixedSingle,
@@ -187,11 +234,14 @@ namespace CameraNumberDetect
             panelInfo.Controls.Add(lblResult);
             panelInfo.Controls.Add(lblCaptureStatus);
             panelInfo.Controls.Add(lblStatsHeader);
+            panelInfo.Controls.Add(btnResetCount);
             panelInfo.Controls.Add(lblTotalCount);
             panelInfo.Controls.Add(lblColorCounts);
             panelInfo.Controls.Add(lblDigitCounts);
             panelInfo.Controls.Add(lblCropHeader);
             panelInfo.Controls.Add(pictureBoxCrop);
+            panelInfo.Controls.Add(lblDigitPatchHeader);
+            panelInfo.Controls.Add(pictureBoxDigitPatch);
 
             // [초기 상태] "전체" 선택된 상태로 시작 (기준 없음)
             SetExpectedColor(null);
@@ -201,7 +251,7 @@ namespace CameraNumberDetect
             btnExit = new Button
             {
                 Text = "프로그램 종료",
-                Location = new System.Drawing.Point(1090, 700),
+                Location = new System.Drawing.Point(1090, 650),
                 Size = new System.Drawing.Size(110, 35),
                 Font = new System.Drawing.Font("맑은 고딕", 10f, System.Drawing.FontStyle.Bold),
                 ForeColor = System.Drawing.Color.White,
@@ -210,6 +260,61 @@ namespace CameraNumberDetect
             };
             btnExit.Click += (s, e) => this.Close();
             this.Controls.Add(btnExit);
+
+            // [신규] 배경 학습 시작/종료 버튼 - 누르는 순간부터 배경을 학습하고,
+            // 다시 누르면 학습을 멈추고 그 배경 정보로 판정을 시작함
+            btnLearnBackground = new Button
+            {
+                Text = "배경 학습 시작",
+                Location = new System.Drawing.Point(950, 650),
+                Size = new System.Drawing.Size(130, 35),
+                Font = new System.Drawing.Font("맑은 고딕", 10f, System.Drawing.FontStyle.Bold),
+                ForeColor = System.Drawing.Color.White,
+                BackColor = System.Drawing.Color.FromArgb(40, 90, 150),
+                FlatStyle = FlatStyle.Flat,
+            };
+            btnLearnBackground.Click += (s, e) => ToggleBackgroundLearning();
+            this.Controls.Add(btnLearnBackground);
+        }
+
+        // [신규] 배경 학습 시작/종료를 토글하는 함수
+        private void ToggleBackgroundLearning()
+        {
+            if (!isBackgroundLearning)
+            {
+                // [학습 시작] - history를 넉넉하게 잡아서 오래(여러 바퀴) 학습해도 다 기억하게 함
+                bgSubtractor = BackgroundSubtractorMOG2.Create(2000, 16, true);
+                isBackgroundLearning = true;
+                backgroundLearningStopwatch = System.Diagnostics.Stopwatch.StartNew();
+                btnLearnBackground.Text = "배경 학습 종료";
+            }
+            else
+            {
+                // [학습 종료] - 이 시점부터 판정 모드로 전환, 배경 모델은 더 이상 업데이트 안 됨
+                isBackgroundLearning = false;
+                btnLearnBackground.Text = "배경 학습 시작";
+            }
+        }
+
+        // [신규] 오늘 통계(카운트)를 전부 0으로 되돌리는 함수
+        // 중복집계 방지용 상태값(lastCountedKey 등)도 같이 초기화해야, 리셋 직후에
+        // "방금 전에 이미 카운트했던 뚜껑"으로 잘못 기억해서 새 카운트를 막는 일이 없음
+        private void ResetCounts()
+        {
+            totalInspectedCount = 0;
+            colorCounts["화이트"] = 0;
+            colorCounts["파랑"] = 0;
+            colorCounts["빨강"] = 0;
+            digitCounts["1"] = 0;
+            digitCounts["2"] = 0;
+            digitCounts["3"] = 0;
+            lastCountedKey = null;
+            candidateKey = null;
+            candidateStableFrames = 0;
+
+            lblTotalCount.Text = "오늘 검사: 0건";
+            lblColorCounts.Text = "화이트 0   파랑 0   빨강 0";
+            lblDigitCounts.Text = "1번 0   2번 0   3번 0";
         }
 
         // [신규] 검사 기준 버튼 하나 만드는 도우미 함수
@@ -406,7 +511,8 @@ namespace CameraNumberDetect
         }
 
         // [신규] 마스크(흰색 영역) 안에서 제일 큰 윤곽선 하나만 뽑아주는 공용 함수
-        // (CropLidArea에서 뚜껑 영역 찾을 때 사용 중 - 계속 유지)
+        // (숫자 모양 추출(ExtractDigitPatchForCnn)에서 사용 중 - 숫자는 원형이 아니라서
+        //  원형도 체크 없이 그냥 제일 큰 것만 찾음. 뚜껑 영역 찾기는 GetBiggestCircularContour로 분리됨)
         private OpenCvSharp.Point[] GetBiggestContour(Mat mask)
         {
             Cv2.FindContours(mask, out OpenCvSharp.Point[][] contours, out HierarchyIndex[] hierarchy,
@@ -429,6 +535,101 @@ namespace CameraNumberDetect
                 }
             }
             return biggest;
+        }
+
+        // [신규] 마스크 안에서 "원형에 가장 가까운" 가장 큰 윤곽선을 찾는 함수
+        // (CropLidArea 전용 - 뚜껑은 원형이니까, 반사광처럼 삐뚤빼뚤하거나 길쭉한 덩어리는
+        //  아무리 커도 애초에 후보에서 제외함. 숫자 추출(GetBiggestContour)엔 안 씀 - 숫자는 안 둥그니까)
+        // 원형도(circularity) = 4π×면적 / 둘레² → 완벽한 원이면 1.0, 찌그러질수록 0에 가까워짐
+        //
+        // [신규] 원형도는 원본 윤곽선이 아니라 볼록 껍질(convex hull)로 감싼 뒤 계산함.
+        // 벨트 텍스처 때문에 마스크 경계가 톱니처럼 삐죽삐죽하게 나오는데, 이걸 원본 그대로
+        // 쓰면 실제로는 둥근 뚜껑이어도 둘레만 부풀려져서 원형도가 뚝 떨어지는 문제가 있었음.
+        // hull로 감싸면 삐죽삐죽한 부분은 무시되고 전체적인 큰 형태만 남아서 훨씬 정확해짐
+        private OpenCvSharp.Point[] GetBiggestCircularContour(Mat mask, double minCircularity = 0.6)
+        {
+            Cv2.FindContours(mask, out OpenCvSharp.Point[][] contours, out HierarchyIndex[] hierarchy,
+                RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+
+            OpenCvSharp.Point[] best = null;
+            double bestArea = 0;
+
+            foreach (var contour in contours)
+            {
+                OpenCvSharp.Point[] hull = Cv2.ConvexHull(contour);
+                double area = Cv2.ContourArea(hull);
+                double perimeter = Cv2.ArcLength(hull, true);
+                if (perimeter <= 0)
+                {
+                    continue;
+                }
+
+                double circularity = 4 * Math.PI * area / (perimeter * perimeter);
+                System.Diagnostics.Debug.WriteLine($"윤곽선 후보 - 면적(hull):{area:F0}, 원형도(hull기준):{circularity:F2}");
+
+                // [원형 아닌 건 후보에서 제외] 아무리 커도 둥글지 않으면 뚜껑이 아님
+                if (circularity < minCircularity)
+                {
+                    continue;
+                }
+
+                if (area > bestArea)
+                {
+                    bestArea = area;
+                    best = contour;
+                }
+            }
+
+            return best;
+        }
+
+        // [신규] 분석할 가운데 구간(ROI)의 사각형 범위를 계산해주는 함수
+        // (화면 전체 중 좌우 가장자리 - 컨베이어벨트 금속 레일 위치 - 를 제외한 영역)
+        private Rect GetAnalysisRoi(Mat colorMat)
+        {
+            int leftX = (int)(colorMat.Width * RoiLeftMarginPercent / 100.0);
+            int rightX = (int)(colorMat.Width * (100.0 - RoiRightMarginPercent) / 100.0);
+            int roiWidth = rightX - leftX;
+            return new Rect(leftX, 0, roiWidth, colorMat.Height);
+        }
+
+        // [신규] 배경 학습 모델(bgSubtractor)로 "학습된 배경과 다르게 새로 나타난 부분(=뚜껑)"만
+        // 뽑아낸 흑백 마스크를 만들어주는 함수
+        // learningRate=0으로 고정 - 학습 단계에서 이미 배운 배경을 그대로 쓰고,
+        // 판정 중에는 배경을 더 이상 업데이트하지 않음
+        private Mat GetForegroundMask(Mat colorMat)
+        {
+            Mat fgMask = new Mat();
+            bgSubtractor.Apply(colorMat, fgMask, 0);
+
+            // [신규 - 완화] detectShadows=true라 그림자는 회색(127)으로 나오는데,
+            // 뚜껑 표면 자체의 어두운 음영 부분까지 "그림자"로 오분류되어 잘려나가는 문제가
+            // 의심됨(진짜 뚜껑 크기가 예상보다 훨씬 작게 잡히는 현상과 일치) → 기준을 낮춰서
+            // 그림자(127)로 분류된 부분도 일단 전경에 포함시킴 (기준 200 → 50)
+            Cv2.Threshold(fgMask, fgMask, 50, 255, ThresholdTypes.Binary);
+
+            // [레일 구간 강제 제외] 양쪽 금속 레일 부분은 배경 학습이 불완전해도 절대 뚜껑으로
+            // 안 잡히게, 아예 그 부분을 검정(배경)으로 덮어씀
+            Rect roi = GetAnalysisRoi(colorMat);
+            if (roi.X > 0)
+            {
+                Cv2.Rectangle(fgMask, new Rect(0, 0, roi.X, fgMask.Rows), Scalar.All(0), -1);
+            }
+            int rightStart = roi.X + roi.Width;
+            if (rightStart < fgMask.Cols)
+            {
+                Cv2.Rectangle(fgMask, new Rect(rightStart, 0, fgMask.Cols - rightStart, fgMask.Rows), Scalar.All(0), -1);
+            }
+
+            // [노이즈 정리] 자잘한 점 노이즈 제거(열림) → 뚜껑 영역 안 구멍 메우기(닫힘)
+            Mat openKernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new OpenCvSharp.Size(3, 3));
+            Cv2.MorphologyEx(fgMask, fgMask, MorphTypes.Open, openKernel);
+            Mat closeKernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new OpenCvSharp.Size(9, 9));
+            Cv2.MorphologyEx(fgMask, fgMask, MorphTypes.Close, closeKernel);
+            openKernel.Dispose();
+            closeKernel.Dispose();
+
+            return fgMask;
         }
 
         // [신규] 자동촬영 중인 뚜껑 이미지를 색깔+숫자별 폴더에 저장하는 함수
@@ -489,7 +690,13 @@ namespace CameraNumberDetect
             device.Parameters.SetEnumValueByString("TriggerMode", "Off");
 
             device.Parameters.SetEnumValueByString("ExposureAuto", "Off");
-            device.Parameters.SetFloatValue("ExposureTime", 50000);
+            // [확정값] MVS에서 실시간으로 조절해서 화면이 제일 선명하고 적당히 밝았던 값 그대로 반영
+            device.Parameters.SetFloatValue("ExposureTime", 37021);
+
+            device.Parameters.SetEnumValueByString("GainAuto", "Off");
+            int gainResult = device.Parameters.SetFloatValue("Gain", 1.6155f);
+            System.Diagnostics.Debug.WriteLine(
+                gainResult == MvError.MV_OK ? "게인 설정 성공" : $"게인 설정 실패! 에러코드: {gainResult}");
 
             isGrabbing = true;
             device.StreamGrabber.StartGrabbing();
@@ -527,6 +734,52 @@ namespace CameraNumberDetect
                     Mat displayMat = new Mat();
                     Cv2.Resize(mat, displayMat, new OpenCvSharp.Size(mat.Width / 3, mat.Height / 3));
 
+                    // [신규] 아직 배경 학습을 한 번도 안 했으면 - 판정 자체가 불가능하니 안내만 하고 건너뜀
+                    if (bgSubtractor == null)
+                    {
+                        System.Drawing.Bitmap waitBitmap = MatToBitmap(displayMat);
+                        UpdateUi(() =>
+                        {
+                            var oldMain = pictureBox1.Image;
+                            pictureBox1.Image = waitBitmap;
+                            oldMain?.Dispose();
+                            lblResult.Text = "[배경 학습 시작] 버튼을\n먼저 눌러주세요";
+                        });
+                        displayMat.Dispose();
+                        bayerMat.Dispose();
+                        mat.Dispose();
+                        device.StreamGrabber.FreeImageBuffer(frameOut);
+                        continue;
+                    }
+
+                    // [신규] 배경 학습 중이면 - 판정은 건너뛰고, MOG2에 이 프레임만 흘려보내면서
+                    // 화면엔 경과 시간만 보여줌 (버튼을 다시 누를 때까지 계속 학습)
+                    if (isBackgroundLearning)
+                    {
+                        using (Mat learnMask = new Mat())
+                        {
+                            bgSubtractor.Apply(displayMat, learnMask); // learningRate 기본값(자동)으로 학습
+                        }
+
+                        double elapsedSeconds = backgroundLearningStopwatch.Elapsed.TotalSeconds;
+                        System.Drawing.Bitmap learningBitmap = MatToBitmap(displayMat);
+                        string learningText = $"배경 학습 중... ({elapsedSeconds:F0}초 경과)\n벨트가 충분히 여러 바퀴 돌면\n[배경 학습 종료] 버튼을 눌러주세요";
+
+                        UpdateUi(() =>
+                        {
+                            var oldMain = pictureBox1.Image;
+                            pictureBox1.Image = learningBitmap;
+                            oldMain?.Dispose();
+                            lblResult.Text = learningText;
+                        });
+
+                        displayMat.Dispose();
+                        bayerMat.Dispose();
+                        mat.Dispose();
+                        device.StreamGrabber.FreeImageBuffer(frameOut);
+                        continue; // 판정 로직은 건너뛰고 다음 프레임으로
+                    }
+
                     string lidColor = ClassifyLidColor(displayMat);
                     System.Diagnostics.Debug.WriteLine("판정된 색깔: " + lidColor);
 
@@ -551,6 +804,9 @@ namespace CameraNumberDetect
                             autoCaptureStatusText = $"● 자동촬영 중: 숫자{captureDigit} ({captureSavedCount}장)";
                         }
 
+                        // [신규] CNN 입력 미리보기용 비트맵 - digitPatch가 없으면(뚜껑 없음 등) null로 둠
+                        System.Drawing.Bitmap digitPatchBitmap = null;
+
                         // [신규] CNN으로 숫자 판정 - 전처리 → 추론 → 뚜껑색/숫자색/숫자 합쳐서 화면에 표시
                         // (뚜껑이 화면에 없으면(lidColor=="없음") 판정 자체를 건너뜀 - 노이즈 오판정 방지)
                         if (lidColor != "없음")
@@ -559,6 +815,14 @@ namespace CameraNumberDetect
                             {
                                 if (digitPatch != null)
                                 {
+                                    // [신규] CNN 입력 미리보기 - digitPatch는 흑백(1채널)이라
+                                    // MatToBitmap(3채널 전제)에 넣기 전에 컬러로 변환해줘야 함
+                                    using (Mat digitPatchBgr = new Mat())
+                                    {
+                                        Cv2.CvtColor(digitPatch, digitPatchBgr, ColorConversionCodes.GRAY2BGR);
+                                        digitPatchBitmap = MatToBitmap(digitPatchBgr);
+                                    }
+
                                     string predictedDigit = RunDigitInference(digitPatch);
                                     if (predictedDigit != null && lidToDigitColorMap.ContainsKey(lidColor))
                                     {
@@ -633,6 +897,12 @@ namespace CameraNumberDetect
                             pictureBoxCrop.Image = cropBitmap;
                             oldCrop?.Dispose();
 
+                            // [신규] CNN 입력 미리보기 갱신 - digitPatchBitmap이 null이면
+                            // (뚜껑이 없거나 숫자 추출 실패) 이전 이미지를 그대로 지워서 혼동 방지
+                            var oldDigitPatch = pictureBoxDigitPatch.Image;
+                            pictureBoxDigitPatch.Image = digitPatchBitmap;
+                            oldDigitPatch?.Dispose();
+
                             lblResult.Text = resultText;
                             lblCaptureStatus.Text = autoCaptureStatusText;
                             lblTotalCount.Text = statsTotalText;
@@ -655,21 +925,27 @@ namespace CameraNumberDetect
         }
 
         // [신규] 뚜껑이 있는 영역만 사각형으로 딱 잘라내는 함수
+        // (배경 학습 마스크(GetForegroundMask) 기준으로 위치 찾음)
         private Mat CropLidArea(Mat colorMat)
         {
-            using (Mat gray = new Mat())
-            using (Mat mask = new Mat())
+            using (Mat mask = GetForegroundMask(colorMat))
             {
-                Cv2.CvtColor(colorMat, gray, ColorConversionCodes.BGR2GRAY);
-                Cv2.Threshold(gray, mask, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
-
-                OpenCvSharp.Point[] biggest = GetBiggestContour(mask);
+                OpenCvSharp.Point[] biggest = GetBiggestCircularContour(mask);
                 if (biggest == null)
                 {
                     return colorMat.Clone();
                 }
 
                 Rect boundingBox = Cv2.BoundingRect(biggest);
+
+                // [크래시 방지] 노이즈가 아주 얇은 조각으로 잘못 잡히면 뒤 단계(숫자추출)에서
+                // AccessViolationException 나던 문제 있었음 - 너무 작으면 "못 찾음"과 동일하게 처리
+                const int minCropSize = 20;
+                if (boundingBox.Width < minCropSize || boundingBox.Height < minCropSize)
+                {
+                    return colorMat.Clone();
+                }
+
                 Mat cropped = new Mat(colorMat, boundingBox);
                 return cropped.Clone();
             }
@@ -700,9 +976,18 @@ namespace CameraNumberDetect
             double medianG = Median(roiPixels.Select(p => (double)p.Item1));
             double medianR = Median(roiPixels.Select(p => (double)p.Item2));
 
+            // [신규] 색 거리 계산 "전에" 먼저 블러 처리 - 글리터 반짝임 노이즈를 미리 주변과
+            // 섞어서 완화함. 기존에 있던 블러(diffNormalized에 적용하는 것)는 반짝이는 픽셀이
+            // 이미 극단적인 값을 만들어놓은 "뒤"라서 이미 늦은 시점이었음
+            // ⚠️ 파이썬 train_digit_cnn.py의 extract_digit_patch()에도 반드시 똑같이 추가하고
+            //    재학습해야 실제 효과가 있음 - C#만 바꾸면 학습 때와 다른 전처리를 넣는 셈이라 더 나빠짐
+            Mat blurredForDiff = new Mat();
+            Cv2.GaussianBlur(croppedLidBgr, blurredForDiff, new OpenCvSharp.Size(7, 7), 0);
+
             // [배경과의 색 거리 계산] 각 픽셀이 배경색이랑 얼마나 다른지(유클리드 거리)
             Mat floatMat = new Mat();
-            croppedLidBgr.ConvertTo(floatMat, MatType.CV_32FC3);
+            blurredForDiff.ConvertTo(floatMat, MatType.CV_32FC3);
+            blurredForDiff.Dispose();
             Mat[] channels = Cv2.Split(floatMat);
             Cv2.Subtract(channels[0], Scalar.All(medianB), channels[0]);
             Cv2.Subtract(channels[1], Scalar.All(medianG), channels[1]);
@@ -854,57 +1139,68 @@ namespace CameraNumberDetect
         }
 
         // [신규] 뚜껑 색깔 판정 함수
-        // 뚜껑이 화면에 아예 없을 때, Otsu 이진화가 배경 자체의 미세한 밝기 차이를
-        // 억지로 갈라서 큰 덩어리를 "뚜껑"으로 오인하는 걸 막기 위해
-        // 인식된 영역이 적절한 범위(2~25%) 안에 있을 때만 진짜 뚜껑으로 인정함
-        // (실측: 빈 화면 46.2% / 진짜 뚜껑 4.8% - 카메라 시야가 뚜껑보다 훨씬 넓어서
-        //  진짜 물체가 있을 때 오히려 계산되는 비율이 작게 나옴)
-        private const double MinLidAreaRatioPercent = 2.0;
-        private const double MaxLidAreaRatioPercent = 25.0;
+        // [잠정치 - 아직 실측 전] 배경학습 마스크 기준(원형 뚜껑 자체 면적 대비)으로 계산 방식이 바뀌어서,
+        // 이전 기준이 그대로 안 맞음 - 실제 로그 보고 다시 정확히 맞출 것
+        private const double MinLidAreaRatioPercent = 3.0;
+        private const double MaxLidAreaRatioPercent = 20.0;
 
+        // (CropLidArea랑 똑같이 원형 체크(GetBiggestCircularContour)를 거친 뚜껑 모양만 보고 판정
+        //  - 예전엔 화면 전체 전경 픽셀을 다 합쳐서 계산해서, 크롭엔 안 걸리는 자잘한 노이즈가
+        //    판정에는 몰래 섞여 들어가는 문제가 있었음)
         private string ClassifyLidColor(Mat colorMat)
         {
-            using (Mat gray = new Mat())
-            using (Mat mask = new Mat())
-            using (Mat hsv = new Mat())
+            using (Mat fgMask = GetForegroundMask(colorMat))
             {
-                Cv2.CvtColor(colorMat, gray, ColorConversionCodes.BGR2GRAY);
-                Cv2.Threshold(gray, mask, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
-
-                int maskPixels = Cv2.CountNonZero(mask);
-                double maskRatio = (double)maskPixels / (mask.Rows * mask.Cols) * 100;
-                System.Diagnostics.Debug.WriteLine($"뚜껑으로 인식된 영역: {maskRatio:F1}%");
-
-                // [뚜껑 없음 판정] 범위를 벗어나면(너무 작거나, 너무 크면) 뚜껑이 아닐 가능성이 높음
-                if (maskRatio < MinLidAreaRatioPercent || maskRatio > MaxLidAreaRatioPercent)
+                OpenCvSharp.Point[] biggest = GetBiggestCircularContour(fgMask);
+                if (biggest == null)
                 {
                     return "없음";
                 }
 
-                Cv2.CvtColor(colorMat, hsv, ColorConversionCodes.BGR2HSV);
-                Scalar meanHsv = Cv2.Mean(hsv, mask);
-                double avgHue = meanHsv.Val0;
-                double avgSat = meanHsv.Val1;
-                double avgVal = meanHsv.Val2;
+                // [신규] 원형 윤곽선 "안쪽만" 255로 채운 마스크를 새로 만듦 - 이 뚜껑 모양
+                // 바깥에 남아있는 다른 노이즈 픽셀은 여기 안 들어와서 판정에 영향 안 줌
+                using (Mat lidOnlyMask = Mat.Zeros(fgMask.Size(), MatType.CV_8UC1))
+                using (Mat hsv = new Mat())
+                {
+                    Cv2.DrawContours(lidOnlyMask, new[] { biggest }, -1, Scalar.All(255), -1);
 
-                System.Diagnostics.Debug.WriteLine(
-                    $"평균 색상 - Hue:{avgHue:F1}, Sat:{avgSat:F1}, Val:{avgVal:F1}");
+                    int maskPixels = Cv2.CountNonZero(lidOnlyMask);
+                    double maskRatio = (double)maskPixels / (lidOnlyMask.Rows * lidOnlyMask.Cols) * 100;
+                    System.Diagnostics.Debug.WriteLine($"뚜껑으로 인식된 영역: {maskRatio:F1}%");
 
-                if (avgSat < 40)
-                {
-                    return "화이트";
-                }
-                else if (avgHue <= 25 || avgHue >= 155)
-                {
-                    return "빨강";
-                }
-                else if (avgHue >= 100 && avgHue <= 130)
-                {
-                    return "파랑";
-                }
-                else
-                {
-                    return "판정불가";
+                    // [뚜껑 없음 판정] 범위를 벗어나면(너무 작거나, 너무 크면) 뚜껑이 아닐 가능성이 높음
+                    if (maskRatio < MinLidAreaRatioPercent || maskRatio > MaxLidAreaRatioPercent)
+                    {
+                        return "없음";
+                    }
+
+                    Cv2.CvtColor(colorMat, hsv, ColorConversionCodes.BGR2HSV);
+                    Scalar meanHsv = Cv2.Mean(hsv, lidOnlyMask);
+                    double avgHue = meanHsv.Val0;
+                    double avgSat = meanHsv.Val1;
+                    double avgVal = meanHsv.Val2;
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"평균 색상 - Hue:{avgHue:F1}, Sat:{avgSat:F1}, Val:{avgVal:F1}");
+
+                    if (avgSat < 40)
+                    {
+                        return "화이트";
+                    }
+                    // [수정] 실측 결과 이 뚜껑의 빨강이 순수 빨강이 아니라 오렌지/구릿빛에 가까워서
+                    // Hue가 40 근처로 나옴 - 기존 기준(25)보다 넉넉하게 45까지 확장
+                    else if (avgHue <= 45 || avgHue >= 155)
+                    {
+                        return "빨강";
+                    }
+                    else if (avgHue >= 100 && avgHue <= 130)
+                    {
+                        return "파랑";
+                    }
+                    else
+                    {
+                        return "판정불가";
+                    }
                 }
             }
         }
