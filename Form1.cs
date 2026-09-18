@@ -67,16 +67,23 @@ namespace CameraNumberDetect
         {
             { "1", 0 }, { "2", 0 }, { "3", 0 },
         };
-        // [중복집계 방지 - 재설계] 시간(프레임 수)으로 판단하는 대신,
-        // "지금 결과가 방금 전 카운트한 조합이랑 다른가"로 판단하는 방식.
-        // - 같은 뚜껑이 계속 있거나, 손이 잠깐 지나갔다 같은 뚜껑으로 돌아오면 → lastCountedKey랑
-        //   똑같으니까 중복 카운트 안 됨
-        // - 다른 뚜껑으로 바뀌면 → 조합이 달라지니까 대기시간 없이 바로 새로 카운트됨
-        //   (뚜껑을 빠르게 바꿔치기해도 안전하게 작동)
-        string lastCountedKey = null;     // 마지막으로 카운트했던 조합 ("화이트_검정_2" 이런 식)
+        // [중복집계 방지 - 재설계 v2] "값이 다른가"가 아니라 "물체가 실제로 지나갔는가"로 판단.
+        // v1 문제: 벨트가 움직이면서 한 프레임만 잠깐 "없음"으로 튀어도 즉시 "물체가 사라졌다"고
+        // 착각해서, 같은 뚜껑이 지나가는 도중에 여러 건으로 중복 카운트되는 문제가 있었음
+        // (모션블러로 색/숫자가 흔들려서 다른 조합으로 잘못 읽히는 경우 특히 심함)
         string candidateKey = null;       // 지금 후보로 보이고 있는 조합
         int candidateStableFrames = 0;    // 그 후보가 몇 프레임 연속으로 똑같이 나왔는지
-        const int stabilityThreshold = 5; // 이 프레임 수만큼 연속으로 같아야 "확실하다"고 보고 카운트함
+        // [수정] 5 → 2 → 3. "완성형(ROI 안에 완전히 들어옴)" 조건 추가 후, 완성형 구간이
+        // 벨트 속도상 짧아서 5프레임을 다 못 채우고 카운트가 안 되는 문제로 2까지 낮췄었는데,
+        // 2는 너무 낮아서 빈 화면의 순간적인 오인식까지 카운트되는 문제가 생김 - 3으로 절충
+        // ※ 잠정치 - 오카운트 계속되면 더 올리고, 못 세는 게 다시 생기면 2로 되돌릴 것
+        const int stabilityThreshold = 3;
+        bool objectAlreadyCounted = false; // 지금 지나가는 물체를 이미 카운트했는지
+        int absentFrameCount = 0;          // "없음"이 몇 프레임 연속으로 나왔는지
+        // ※ 잠정치 - 벨트 속도에 따라 조정 필요. 너무 작으면 모션블러로 인한 한두 프레임짜리
+        //   "없음"에도 물체가 사라졌다고 오판할 수 있고, 너무 크면 진짜 다음 물체가 빨리
+        //   연달아 들어왔을 때 카운트를 못 할 수 있음
+        const int absentStabilityThreshold = 8;
         readonly string inspectionLogPath = Path.Combine(Application.StartupPath, "InspectionLog.csv");
 
         // [신규] 대시보드 UI 컨트롤들 - 전부 코드에서 직접 생성 (디자이너 파일 안 건드림)
@@ -182,6 +189,11 @@ namespace CameraNumberDetect
             lblCaptureStatus = CreateLabel("", 10, 195, 11f, true, System.Drawing.Color.OrangeRed);
 
             lblStatsHeader = CreateLabel("오늘 통계", 10, 235, 12f, true, System.Drawing.Color.White);
+            // [수정] CreateLabel이 라벨 폭을 무조건 340(패널 거의 전체 너비)으로 만들어서,
+            // 이 폭이 옆에 있는 리셋 버튼(x:280~340)까지 뒤덮어버리는 문제가 있었음.
+            // 라벨이 버튼보다 먼저 추가되어 z-order상 앞에 그려지다 보니, 버튼이 라벨 뒤에
+            // 완전히 가려져서 안 보였던 것 - 라벨 폭을 텍스트 길이에 맞게 좁혀서 해결
+            lblStatsHeader.Size = new System.Drawing.Size(150, 25);
 
             // [신규] 통계 리셋 버튼 - 오늘 통계 헤더 옆에 작게 배치
             btnResetCount = new Button
@@ -235,6 +247,8 @@ namespace CameraNumberDetect
             panelInfo.Controls.Add(lblCaptureStatus);
             panelInfo.Controls.Add(lblStatsHeader);
             panelInfo.Controls.Add(btnResetCount);
+            // [수정] z-order 문제로 라벨 뒤에 가려지는 일이 없게, 추가한 뒤 명시적으로 맨 앞으로
+            btnResetCount.BringToFront();
             panelInfo.Controls.Add(lblTotalCount);
             panelInfo.Controls.Add(lblColorCounts);
             panelInfo.Controls.Add(lblDigitCounts);
@@ -297,8 +311,8 @@ namespace CameraNumberDetect
         }
 
         // [신규] 오늘 통계(카운트)를 전부 0으로 되돌리는 함수
-        // 중복집계 방지용 상태값(lastCountedKey 등)도 같이 초기화해야, 리셋 직후에
-        // "방금 전에 이미 카운트했던 뚜껑"으로 잘못 기억해서 새 카운트를 막는 일이 없음
+        // 중복집계 방지용 상태값도 같이 초기화해야, 리셋 직후에 "이미 카운트한 물체"로
+        // 잘못 기억해서 다음 물체를 못 세는 일이 없음
         private void ResetCounts()
         {
             totalInspectedCount = 0;
@@ -308,9 +322,10 @@ namespace CameraNumberDetect
             digitCounts["1"] = 0;
             digitCounts["2"] = 0;
             digitCounts["3"] = 0;
-            lastCountedKey = null;
             candidateKey = null;
             candidateStableFrames = 0;
+            objectAlreadyCounted = false;
+            absentFrameCount = 0;
 
             lblTotalCount.Text = "오늘 검사: 0건";
             lblColorCounts.Text = "화이트 0   파랑 0   빨강 0";
@@ -780,37 +795,66 @@ namespace CameraNumberDetect
                         continue; // 판정 로직은 건너뛰고 다음 프레임으로
                     }
 
-                    string lidColor = ClassifyLidColor(displayMat);
+                    string lidColor = ClassifyLidColor(displayMat, out Rect lidBox);
                     System.Diagnostics.Debug.WriteLine("판정된 색깔: " + lidColor);
+
+                    // [신규] 뚜껑이 분석 구간 가장자리에 걸쳐있으면(들어오는 중/나가는 중)
+                    // "완성형이 아니다"로 보고, 판정/카운팅 자체를 건너뜀 - 두 뚜껑이 겹치거나
+                    // 반쯤 걸친 애매한 순간에 잘못 읽혀서 튀는 오판정을 원천 차단하기 위함
+                    Rect analysisRoi = GetAnalysisRoi(displayMat);
+                    bool isLidComplete = (lidColor == "없음") || IsLidFullyInsideRoi(lidBox, analysisRoi);
 
                     // [화면에 표시할 텍스트들] 이번 프레임에서 뭘 보여줄지 미리 준비해뒀다가
                     // 마지막에 한 번에 UI 스레드로 넘겨서 갱신함
-                    string autoCaptureStatusText = "";
+                    string autoCaptureStatusText = isAutoCapturing
+                        ? $"● 자동촬영 중: 숫자{captureDigit} ({captureSavedCount}장)"
+                        : "";
                     string resultText = "대기 중 (뚜껑을 카메라 앞에 놓아주세요)";
 
                     using (Mat croppedLid = CropLidArea(displayMat))
                     {
-                        // [신규] 자동촬영 중이면 - 몇 프레임마다 한 장씩 크롭된 뚜껑 이미지를 저장
-                        // (마스크가 아니라 색상 원본을 저장 - CNN이 색상 정보까지 보고 학습해야 하니까)
-                        if (isAutoCapturing)
-                        {
-                            captureFrameCounter++;
-                            if (captureFrameCounter >= captureFrameInterval)
-                            {
-                                captureFrameCounter = 0;
-                                SaveTrainingImage(croppedLid, lidColor, captureDigit);
-                            }
-
-                            autoCaptureStatusText = $"● 자동촬영 중: 숫자{captureDigit} ({captureSavedCount}장)";
-                        }
-
                         // [신규] CNN 입력 미리보기용 비트맵 - digitPatch가 없으면(뚜껑 없음 등) null로 둠
                         System.Drawing.Bitmap digitPatchBitmap = null;
 
-                        // [신규] CNN으로 숫자 판정 - 전처리 → 추론 → 뚜껑색/숫자색/숫자 합쳐서 화면에 표시
-                        // (뚜껑이 화면에 없으면(lidColor=="없음") 판정 자체를 건너뜀 - 노이즈 오판정 방지)
-                        if (lidColor != "없음")
+                        if (lidColor == "없음")
                         {
+                            // [신규] "없음"이 여러 프레임 연속으로 나와야 진짜로 물체가 지나갔다고
+                            // 인정함 - 한두 프레임만 잠깐 "없음"으로 튀는 것(모션블러 등)까지
+                            // "물체가 사라졌다"고 착각하면, 같은 물체가 다시 잡히는 순간 새 물체로
+                            // 오인해서 중복 카운트되는 문제가 있었음
+                            absentFrameCount++;
+                            if (absentFrameCount >= absentStabilityThreshold)
+                            {
+                                candidateKey = null;
+                                candidateStableFrames = 0;
+                                objectAlreadyCounted = false;
+                            }
+                        }
+                        else if (!isLidComplete)
+                        {
+                            // [신규] 뚜껑이 ROI 가장자리에 걸쳐서 아직 들어오는 중/나가는 중 -
+                            // "완성형"이 아니므로 판정/카운팅/자동촬영저장 전부 건너뜀.
+                            // absence 카운트나 candidate 상태도 안 건드리고 그냥 다음 프레임을
+                            // 기다림 (물체가 실제로 있으니 "사라졌다"고 착각하면 안 됨)
+                        }
+                        else
+                        {
+                            // [완성형] 뚜껑이 ROI 안에 완전히 들어와 있을 때만 여기서 실제 판정 진행
+                            absentFrameCount = 0;
+
+                            // [신규] 자동촬영 중이면 - 몇 프레임마다 한 장씩 크롭된 뚜껑 이미지를 저장
+                            // (완성형일 때만 저장 - 가장자리에 걸쳐 잘린 사진이 학습데이터에
+                            //  섞이는 걸 막기 위함)
+                            if (isAutoCapturing)
+                            {
+                                captureFrameCounter++;
+                                if (captureFrameCounter >= captureFrameInterval)
+                                {
+                                    captureFrameCounter = 0;
+                                    SaveTrainingImage(croppedLid, lidColor, captureDigit);
+                                }
+                            }
+
                             using (Mat digitPatch = ExtractDigitPatchForCnn(croppedLid))
                             {
                                 if (digitPatch != null)
@@ -829,36 +873,33 @@ namespace CameraNumberDetect
                                         string digitColor = lidToDigitColorMap[lidColor];
                                         resultText = $"{lidColor} 뚜껑\n{digitColor} 숫자 {predictedDigit}";
 
-                                        // [신규] 중복집계 방지 - "지금 조합이 후보랑 같은가" 확인
-                                        string detectionKey = $"{lidColor}_{digitColor}_{predictedDigit}";
-                                        if (detectionKey == candidateKey)
+                                        // [신규] 이미 이번 물체를 카운트했으면, 지나가는 동안 값이
+                                        // 흔들려도(모션블러로 다른 색/숫자처럼 잘못 읽혀도) 절대
+                                        // 새로 카운트하지 않음 - 화면 문구는 계속 갱신되지만 카운트는 멈춤
+                                        if (!objectAlreadyCounted)
                                         {
-                                            candidateStableFrames++;
-                                        }
-                                        else
-                                        {
-                                            candidateKey = detectionKey;
-                                            candidateStableFrames = 1;
-                                        }
+                                            string detectionKey = $"{lidColor}_{digitColor}_{predictedDigit}";
+                                            if (detectionKey == candidateKey)
+                                            {
+                                                candidateStableFrames++;
+                                            }
+                                            else
+                                            {
+                                                candidateKey = detectionKey;
+                                                candidateStableFrames = 1;
+                                            }
 
-                                        // [카운트 확정] 몇 프레임 연속으로 안정적으로 같은 결과가 나왔고,
-                                        // 그게 마지막으로 카운트했던 조합이랑 다르면 → 새 물체로 인정하고 카운트
-                                        if (candidateStableFrames >= stabilityThreshold && detectionKey != lastCountedKey)
-                                        {
-                                            RecordInspection(lidColor, digitColor, predictedDigit);
-                                            lastCountedKey = detectionKey;
+                                            // [카운트 확정] 몇 프레임 연속으로 안정적으로 같은 결과가
+                                            // 나오면 → 이 물체를 카운트하고, 완전히 지나갈 때까지 잠금
+                                            if (candidateStableFrames >= stabilityThreshold)
+                                            {
+                                                RecordInspection(lidColor, digitColor, predictedDigit);
+                                                objectAlreadyCounted = true;
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        else
-                        {
-                            // [신규] 뚜껑이 안 보이는 동안은 후보만 리셋 (손 지나감이든 진짜 치움이든 상관없음)
-                            // lastCountedKey는 그대로 유지 - 손 지나갔다 같은 뚜껑으로 돌아오면
-                            // 다시 candidateKey를 새로 쌓아야 하지만, lastCountedKey랑 같아서 재카운트는 안 됨
-                            candidateKey = null;
-                            candidateStableFrames = 0;
                         }
 
                         // [신규] Mat → Bitmap 변환은 Mat이 아직 살아있는(Dispose 되기 전) 이 시점에서 해야 함
@@ -1147,8 +1188,13 @@ namespace CameraNumberDetect
         // (CropLidArea랑 똑같이 원형 체크(GetBiggestCircularContour)를 거친 뚜껑 모양만 보고 판정
         //  - 예전엔 화면 전체 전경 픽셀을 다 합쳐서 계산해서, 크롭엔 안 걸리는 자잘한 노이즈가
         //    판정에는 몰래 섞여 들어가는 문제가 있었음)
-        private string ClassifyLidColor(Mat colorMat)
+        // [수정] 뚜껑을 찾았을 때 그 위치(bounding box)도 같이 반환하도록 함
+        // - 뚜껑이 ROI 가장자리에 걸쳐있으면(들어오는 중/나가는 중) "완성형이 아니다"로
+        //   판단해서 판정을 건너뛰기 위해, 호출하는 쪽에서 위치를 알아야 함
+        private string ClassifyLidColor(Mat colorMat, out Rect lidBox)
         {
+            lidBox = new Rect();
+
             using (Mat fgMask = GetForegroundMask(colorMat))
             {
                 OpenCvSharp.Point[] biggest = GetBiggestCircularContour(fgMask);
@@ -1156,6 +1202,8 @@ namespace CameraNumberDetect
                 {
                     return "없음";
                 }
+
+                lidBox = Cv2.BoundingRect(biggest);
 
                 // [신규] 원형 윤곽선 "안쪽만" 255로 채운 마스크를 새로 만듦 - 이 뚜껑 모양
                 // 바깥에 남아있는 다른 노이즈 픽셀은 여기 안 들어와서 판정에 영향 안 줌
@@ -1203,6 +1251,14 @@ namespace CameraNumberDetect
                     }
                 }
             }
+        }
+
+        // [신규] 뚜껑이 분석 구간(ROI) 안에 "완전히" 들어와 있는지 확인
+        // 가장자리에 걸쳐있으면(들어오는 중/나가는 중) 아직 완성형이 아니라고 봄
+        private bool IsLidFullyInsideRoi(Rect lidBox, Rect roi, int margin = 5)
+        {
+            return lidBox.X > roi.X + margin
+                && (lidBox.X + lidBox.Width) < (roi.X + roi.Width - margin);
         }
 
         // ch: 프로그램(창)을 닫을 때 실행되는 정리 함수
