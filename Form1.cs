@@ -9,6 +9,7 @@ using System.Text.Json;             // label_map.json 읽을 때 필요함
 using System.Threading;             // 영상을 계속 받아오는 작업을 별도 스레드로 돌리기 위해 필요함
 using System.Windows.Forms;
 using System.Runtime.InteropServices; // 비트맵 픽셀 데이터 직접 다룰 때 필요함 (Mat→Bitmap 변환용)
+using System.Net.Sockets;            // [신규] 유니티로 판정 결과를 UDP로 보낼 때 필요함
 using Microsoft.ML.OnnxRuntime;         // ONNX 모델 불러와서 추론 실행하는 기능
 using Microsoft.ML.OnnxRuntime.Tensors; // 모델에 넣을 입력 데이터(텐서) 만드는 기능
 
@@ -125,6 +126,14 @@ namespace CameraNumberDetect
         // [신규] 검사 기준(필터) - 이 색깔이 아니면 불량(빨간 테두리)으로 표시
         // null이면 "전체 허용" 상태 (기준 없음, 중립 테두리)
         string expectedLidColor = null;
+
+        // [신규] 유니티 디지털트윈 연동 (UDP) - 뚜껑을 카운트하는 순간 결과를 한 번 보냄
+        // - 같은 컴퓨터에서 유니티를 켜니까 주소는 127.0.0.1(내 컴퓨터 자신)
+        // - 포트 5053: 손인식 프로젝트(HandBlock)가 5052를 써서 안 겹치게 다른 번호 사용
+        // - UDP는 "받는 쪽이 있든 없든 그냥 던지는" 방식이라, 유니티가 꺼져 있어도 이 프로그램은 멈추지 않음
+        readonly UdpClient unityUdpClient = new UdpClient();
+        const string UnityHost = "127.0.0.1";
+        const int UnityPort = 5053;
 
         public Form1()
         {
@@ -525,6 +534,8 @@ namespace CameraNumberDetect
             btnFilterBlue.BackColor = (color == "파랑") ? selectedColor : normalColor;
             btnFilterRed.BackColor = (color == "빨강") ? selectedColor : normalColor;
             btnFilterAll.BackColor = (color == null) ? selectedColor : normalColor;
+
+            SendCriterionToUnity(); // [신규] 유니티 대시보드에도 기준 변경 알림
         }
 
         // [신규] 라벨 하나 만드는 반복 작업을 줄여주는 도우미 함수
@@ -651,6 +662,73 @@ namespace CameraNumberDetect
 
             string logLine = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss},{lidColor},{digitColor},{digit}\n";
             File.AppendAllText(inspectionLogPath, logLine, Encoding.UTF8);
+
+            SendInspectionToUnity(lidColor, digit); // [신규] 카운트 확정된 결과를 유니티로도 보냄
+        }
+
+        // [유니티 전송] 메시지 종류는 2가지 (JSON 한 줄씩)
+        // 1) 검사 결과: {"type":"inspection","color":"red","digit":"1","good":false,"target":"blue"}
+        //    - 뚜껑을 카운트하는 순간 1번 보냄
+        //    - target(현재 검사 기준)도 같이 실어 보냄 → 유니티를 나중에 켰거나 기준 변경 메시지를 놓쳐도 다음 검사 때 자동으로 맞춰짐
+        // 2) 검사 기준 변경: {"type":"criterion","target":"red"}  ("전체"는 "all")
+        //    - 기준 버튼을 누르는 순간 1번 보냄 → 유니티 화면의 기준 표시가 바로 바뀌고 양품/불량 숫자는 0부터 다시
+        // ※ 색 이름은 영어로 바꿔서 보냄 (한글은 인코딩이 꼬이면 깨질 수 있어서 통신에선 영어가 안전)
+
+        // [신규] 한글 색 이름 → 유니티로 보낼 영어 코드 (모르는 값이면 null)
+        private string ToUnityColorCode(string lidColor)
+        {
+            if (lidColor == "화이트") return "white";
+            if (lidColor == "파랑") return "blue";
+            if (lidColor == "빨강") return "red";
+            return null;
+        }
+
+        // [신규] 지금 검사 기준을 영어 코드로 (null = 전체 → "all")
+        private string GetTargetCode()
+        {
+            return expectedLidColor == null ? "all" : ToUnityColorCode(expectedLidColor);
+        }
+
+        // [수정] 판정 결과 1건을 유니티로 보내는 함수 - type/target 추가
+        // - good: 검사 기준이 "전체"면 항상 양품, 기준 색이 정해져 있으면 그 색일 때만 양품
+        private void SendInspectionToUnity(string lidColor, string digit)
+        {
+            string colorCode = ToUnityColorCode(lidColor);
+            if (colorCode == null) return; // 판정불가 등은 유니티에 안 보냄
+
+            bool isGood = (expectedLidColor == null) || (lidColor == expectedLidColor);
+            string goodText = isGood ? "true" : "false"; // JSON의 true/false는 소문자여야 함
+
+            // $"..." 안에서 중괄호 자체를 쓰려면 {{ }} 처럼 두 번 겹쳐 써야 함
+            string json = $"{{\"type\":\"inspection\",\"color\":\"{colorCode}\",\"digit\":\"{digit}\",\"good\":{goodText},\"target\":\"{GetTargetCode()}\"}}";
+            SendJsonToUnity(json);
+        }
+
+        // [신규] 검사 기준이 바뀌었다고 유니티에 알리는 함수 (기준 버튼 누를 때 호출)
+        private void SendCriterionToUnity()
+        {
+            string json = $"{{\"type\":\"criterion\",\"target\":\"{GetTargetCode()}\"}}";
+            SendJsonToUnity(json);
+        }
+
+        // [신규] 실제로 UDP로 보내는 부분 - 두 종류 메시지가 같이 씀
+        // (기준 변경은 화면 스레드, 검사 결과는 영상 스레드에서 보내서 동시에 보낼 수 있으니 lock으로 한 번에 하나씩)
+        private void SendJsonToUnity(string json)
+        {
+            try
+            {
+                byte[] data = Encoding.UTF8.GetBytes(json);
+                lock (unityUdpClient)
+                {
+                    unityUdpClient.Send(data, data.Length, UnityHost, UnityPort);
+                }
+                System.Diagnostics.Debug.WriteLine("[UNITY] 전송: " + json);
+            }
+            catch (Exception ex)
+            {
+                // 전송 실패해도 검사 프로그램 자체는 계속 돌아가야 하니까 로그만 남김
+                System.Diagnostics.Debug.WriteLine("[UNITY] 전송 실패: " + ex.Message);
+            }
         }
 
         // ch: 폼이 화면에 완전히 뜬 직후 자동으로 실행되는 함수
@@ -1475,6 +1553,8 @@ namespace CameraNumberDetect
                 device.Close();
                 device.Dispose();
             }
+
+            unityUdpClient.Close(); // [신규] 유니티 전송용 소켓 정리
 
             SDKSystem.Finalize();
         }
