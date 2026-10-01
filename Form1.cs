@@ -37,6 +37,19 @@ namespace CameraNumberDetect
         bool isBackgroundLearning = false;
         System.Diagnostics.Stopwatch backgroundLearningStopwatch;
 
+        // [신규] 배경 학습 사진 저장/불러오기 - MOG2는 "배운 상태" 자체를 파일로 저장하는 기능이 없어서,
+        //   대신 "학습할 때 본 장면"을 사진으로 저장해뒀다가 다음 실행 때 다시 먹여서 빠르게 재학습함
+        // - 학습 중에는 임시 폴더(_tmp)에 저장 → 학습 종료 버튼을 누르는 순간 정식 폴더로 교체
+        //   (학습 도중에 프로그램을 꺼도 예전 저장본이 망가지지 않게 하기 위함)
+        readonly string backgroundFramesFolder = Path.Combine(Application.StartupPath, "BackgroundFrames");
+        readonly string backgroundFramesTempFolder = Path.Combine(Application.StartupPath, "BackgroundFrames_tmp");
+        const double backgroundSaveIntervalSeconds = 0.5; // 몇 초마다 한 장씩 저장할지 (200초 학습이면 약 400장)
+        const int maxBackgroundFrames = 600;              // 최대 저장 장수 (용량 폭주 방지, 0.5초 간격이면 약 5분치)
+        const int minBackgroundFramesToUse = 20;          // 이보다 적게 저장됐으면 학습이 너무 짧았던 걸로 보고 안 씀
+        int backgroundSavedCount = 0;                     // 이번 학습에서 저장한 장수
+        double lastBackgroundSaveSeconds = -1;            // 마지막으로 저장한 시점(학습 시작 기준 초), -1이면 아직 없음
+        readonly object backgroundSaveLock = new object(); // 저장(영상 스레드)과 폴더 교체(UI 스레드)가 동시에 안 일어나게 막는 자물쇠
+
         // [신규] 자동촬영(학습 데이터 수집) 관련 상태값들
         bool isAutoCapturing = false;           // "지금 자동촬영 중인가?" 스위치
         string captureDigit = "";               // 지금 촬영 중인 숫자 ("1","2","3")
@@ -84,12 +97,21 @@ namespace CameraNumberDetect
         //   "없음"에도 물체가 사라졌다고 오판할 수 있고, 너무 크면 진짜 다음 물체가 빨리
         //   연달아 들어왔을 때 카운트를 못 할 수 있음
         const int absentStabilityThreshold = 8;
+        // [신규] 위치 점프로 "새 뚜껑" 감지 - 뚜껑을 연달아 올리면 화면이 비는 순간이 없어서
+        //   "없음 8프레임" 조건만으로는 잠금이 영영 안 풀리는 문제가 있었음 (첫 뚜껑만 카운트됨)
+        // - 벨트는 한 방향(왼쪽→오른쪽)으로만 움직이니까, 같은 뚜껑이면 boxX는 커지기만 함
+        // - 잠금 중인데 boxX가 갑자기 크게 작아지면 = 앞 뚜껑이 아니라 뒤에서 새 뚜껑이 들어온 것
+        int lastLidX = -1;                       // 직전 프레임에서 잡힌 뚜껑의 왼쪽 X 좌표, -1이면 아직 없음
+        // ※ 잠정치 - 뚜껑 지름이 화면상 약 246px이라 그 절반보다 작게 잡음. 같은 뚜껑의 흔들림(수 px)보다는
+        //   훨씬 크고, 새 뚜껑이 들어올 때 점프(150px 이상)보다는 작아야 함
+        const int positionJumpThreshold = 100;
         readonly string inspectionLogPath = Path.Combine(Application.StartupPath, "InspectionLog.csv");
 
         // [신규] 대시보드 UI 컨트롤들 - 전부 코드에서 직접 생성 (디자이너 파일 안 건드림)
         Panel panelInfo;
         Panel panelCameraBorder; // pictureBox1을 감싸서 테두리 색으로 양품/불량 표시할 패널
         Label lblResultHeader, lblResult, lblCaptureStatus;
+        Label lblDebugState; // [진단용] 카운트 잠금/없음/안정 상태를 화면에 표시 (원인 확정 후 삭제 예정)
         Label lblStatsHeader, lblTotalCount, lblColorCounts, lblDigitCounts, lblCropHeader;
         Label lblDigitPatchHeader; // [신규] CNN 입력 미리보기 라벨
         Label lblFilterHeader;
@@ -257,6 +279,11 @@ namespace CameraNumberDetect
             panelInfo.Controls.Add(lblDigitPatchHeader);
             panelInfo.Controls.Add(pictureBoxDigitPatch);
 
+            // [진단용] 카운트 상태 표시 라벨 - 크롭 미리보기 아래 빈 공간(y:565)에 2줄로 배치
+            lblDebugState = CreateLabel("", 10, 565, 10f, true, System.Drawing.Color.Yellow);
+            lblDebugState.Size = new System.Drawing.Size(340, 40); // 2줄이 들어가게 높이만 늘림
+            panelInfo.Controls.Add(lblDebugState);
+
             // [초기 상태] "전체" 선택된 상태로 시작 (기준 없음)
             SetExpectedColor(null);
 
@@ -297,6 +324,7 @@ namespace CameraNumberDetect
             if (!isBackgroundLearning)
             {
                 // [학습 시작] - history를 넉넉하게 잡아서 오래(여러 바퀴) 학습해도 다 기억하게 함
+                PrepareBackgroundTempFolder(); // [신규] 이번 학습 사진을 담을 임시 폴더 새로 준비
                 bgSubtractor = BackgroundSubtractorMOG2.Create(2000, 16, true);
                 isBackgroundLearning = true;
                 backgroundLearningStopwatch = System.Diagnostics.Stopwatch.StartNew();
@@ -307,7 +335,144 @@ namespace CameraNumberDetect
                 // [학습 종료] - 이 시점부터 판정 모드로 전환, 배경 모델은 더 이상 업데이트 안 됨
                 isBackgroundLearning = false;
                 btnLearnBackground.Text = "배경 학습 시작";
+                FinalizeBackgroundFrames(); // [신규] 임시 폴더 → 정식 폴더로 교체 (다음 실행부터 자동으로 불러옴)
             }
+        }
+
+        // [신규] 배경 학습 시작할 때 - 임시 폴더를 비우고 새로 만듦 (저장 장수/시점도 초기화)
+        private void PrepareBackgroundTempFolder()
+        {
+            lock (backgroundSaveLock)
+            {
+                try
+                {
+                    if (Directory.Exists(backgroundFramesTempFolder))
+                    {
+                        Directory.Delete(backgroundFramesTempFolder, true); // true = 안에 있는 파일까지 전부 삭제
+                    }
+                    Directory.CreateDirectory(backgroundFramesTempFolder);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("배경 임시 폴더 준비 실패: " + ex.Message);
+                }
+                backgroundSavedCount = 0;
+                lastBackgroundSaveSeconds = -1;
+            }
+        }
+
+        // [신규] 배경 학습 중 - 일정 간격(0.5초)마다 지금 프레임을 임시 폴더에 사진으로 저장
+        // (영상 스레드에서 호출됨)
+        private void SaveBackgroundFrameIfDue(Mat frame, double elapsedSeconds)
+        {
+            if (backgroundSavedCount >= maxBackgroundFrames) return; // 최대 장수 넘으면 그만 저장
+            if (lastBackgroundSaveSeconds >= 0 && elapsedSeconds - lastBackgroundSaveSeconds < backgroundSaveIntervalSeconds) return;
+
+            lock (backgroundSaveLock)
+            {
+                // 학습 종료 버튼이 막 눌려서 폴더가 옮겨진 직후일 수 있으니, 자물쇠 안에서 한 번 더 확인
+                if (!isBackgroundLearning || !Directory.Exists(backgroundFramesTempFolder)) return;
+
+                try
+                {
+                    // [파일명] bg_0001.png 처럼 번호를 4자리로 맞춤 - 불러올 때 이름순 정렬 = 저장한 순서
+                    string fullPath = Path.Combine(backgroundFramesTempFolder, $"bg_{backgroundSavedCount + 1:D4}.png");
+                    Cv2.ImWrite(fullPath, frame); // PNG = 무손실 저장 (JPG는 압축 때문에 픽셀값이 살짝 바뀌어서 배경 학습엔 안 씀)
+                    backgroundSavedCount++;
+                    lastBackgroundSaveSeconds = elapsedSeconds;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("배경 사진 저장 실패: " + ex.Message);
+                }
+            }
+        }
+
+        // [신규] 배경 학습 종료할 때 - 충분히 저장됐으면 임시 폴더를 정식 폴더로 교체
+        private void FinalizeBackgroundFrames()
+        {
+            string message;
+            lock (backgroundSaveLock)
+            {
+                try
+                {
+                    if (backgroundSavedCount >= minBackgroundFramesToUse && Directory.Exists(backgroundFramesTempFolder))
+                    {
+                        if (Directory.Exists(backgroundFramesFolder))
+                        {
+                            Directory.Delete(backgroundFramesFolder, true); // 예전 저장본 삭제
+                        }
+                        Directory.Move(backgroundFramesTempFolder, backgroundFramesFolder); // 폴더 이름만 바꿔서 교체
+                        message = $"배경 사진 {backgroundSavedCount}장 저장 완료!\n다음 실행부터는 자동으로 불러와서 바로 판정을 시작해요.";
+                    }
+                    else
+                    {
+                        message = $"배경 사진이 {backgroundSavedCount}장뿐이라(최소 {minBackgroundFramesToUse}장) 저장하지 않았어요.\n이번 실행에서는 방금 학습한 배경으로 판정합니다.";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    message = "배경 사진 저장 중 오류: " + ex.Message;
+                }
+            }
+            MessageBox.Show(message); // 자물쇠 밖에서 띄움 (창이 떠 있는 동안 자물쇠를 붙잡고 있지 않게)
+        }
+
+        // [신규] 프로그램 시작할 때 - 저장된 배경 사진이 있으면 MOG2에 순서대로 먹여서 재학습
+        // (영상 스레드 시작 직후에 호출됨 - 400장 기준 몇 초 걸림)
+        private void TryLoadSavedBackground()
+        {
+            if (!Directory.Exists(backgroundFramesFolder)) return; // 저장본 없으면 기존처럼 버튼 눌러서 학습
+
+            string[] files = Directory.GetFiles(backgroundFramesFolder, "bg_*.png");
+            if (files.Length < minBackgroundFramesToUse) return;
+            Array.Sort(files, StringComparer.Ordinal); // 이름순 = 저장한 순서
+
+            UpdateUi(() => lblResult.Text = $"저장된 배경 불러오는 중...\n({files.Length}장)");
+
+            // 다 먹이기 전까지는 bgSubtractor에 안 넣고 따로 만들어둠 (반쯤 학습된 상태로 판정하는 것 방지)
+            BackgroundSubtractorMOG2 loaded = BackgroundSubtractorMOG2.Create(2000, 16, true);
+            int usedCount = 0;
+            int firstWidth = 0, firstHeight = 0;
+
+            foreach (string file in files)
+            {
+                if (!isGrabbing) // 불러오는 도중에 창을 닫으면 바로 중단
+                {
+                    loaded.Dispose();
+                    return;
+                }
+
+                using (Mat frame = Cv2.ImRead(file, ImreadModes.Color))
+                using (Mat dummyMask = new Mat())
+                {
+                    if (frame.Empty()) continue; // 깨진 파일은 건너뜀
+
+                    // 크기가 다른 사진이 섞여 있으면 MOG2가 에러를 내니까, 첫 장과 크기가 같은 것만 씀
+                    if (usedCount == 0)
+                    {
+                        firstWidth = frame.Width;
+                        firstHeight = frame.Height;
+                    }
+                    else if (frame.Width != firstWidth || frame.Height != firstHeight)
+                    {
+                        continue;
+                    }
+
+                    loaded.Apply(frame, dummyMask); // 학습할 때와 똑같이 learningRate 기본값(자동)
+                    usedCount++;
+                }
+            }
+
+            // 그 사이에 사용자가 직접 [배경 학습 시작]을 눌렀으면 그쪽을 우선함
+            if (usedCount < minBackgroundFramesToUse || bgSubtractor != null)
+            {
+                loaded.Dispose();
+                return;
+            }
+
+            bgSubtractor = loaded; // 다 먹인 뒤에 한 번에 교체 → 이 순간부터 판정 시작
+            System.Diagnostics.Debug.WriteLine($"저장된 배경 {usedCount}장으로 재학습 완료");
         }
 
         // [신규] 오늘 통계(카운트)를 전부 0으로 되돌리는 함수
@@ -326,6 +491,7 @@ namespace CameraNumberDetect
             candidateStableFrames = 0;
             objectAlreadyCounted = false;
             absentFrameCount = 0;
+            lastLidX = -1; // [신규] 위치 점프 기록도 같이 초기화
 
             lblTotalCount.Text = "오늘 검사: 0건";
             lblColorCounts.Text = "화이트 0   파랑 0   빨강 0";
@@ -723,6 +889,8 @@ namespace CameraNumberDetect
         // ch: 영상을 계속 반복해서 받아오는 함수 (별도 스레드에서 실행됨)
         private void ReceiveThreadProcess()
         {
+            TryLoadSavedBackground(); // [신규] 저장된 배경 사진이 있으면 먼저 불러와서 재학습 (없으면 그냥 넘어감)
+
             while (isGrabbing)
             {
                 IFrameOut frameOut;
@@ -777,6 +945,7 @@ namespace CameraNumberDetect
                         }
 
                         double elapsedSeconds = backgroundLearningStopwatch.Elapsed.TotalSeconds;
+                        SaveBackgroundFrameIfDue(displayMat, elapsedSeconds); // [신규] 0.5초마다 이 장면을 사진으로 저장
                         System.Drawing.Bitmap learningBitmap = MatToBitmap(displayMat);
                         string learningText = $"배경 학습 중... ({elapsedSeconds:F0}초 경과)\n벨트가 충분히 여러 바퀴 돌면\n[배경 학습 종료] 버튼을 눌러주세요";
 
@@ -804,6 +973,22 @@ namespace CameraNumberDetect
                     Rect analysisRoi = GetAnalysisRoi(displayMat);
                     bool isLidComplete = (lidColor == "없음") || IsLidFullyInsideRoi(lidBox, analysisRoi);
 
+                    // [신규] 위치 점프로 "새 뚜껑" 감지 → 잠금 해제
+                    // 이미 카운트하고 잠근 상태인데, 뚜껑 위치(boxX)가 갑자기 크게 뒤로(왼쪽으로) 점프하면
+                    // 앞 뚜껑이 나가고 뒤 뚜껑이 판정 대상으로 바뀐 것 → 다음 물체로 인정
+                    // (가장자리에 걸친 프레임에서도 검사해야 해서, 완성형 여부와 상관없이 여기서 처리)
+                    if (lidColor != "없음")
+                    {
+                        if (objectAlreadyCounted && lastLidX >= 0 && lidBox.X < lastLidX - positionJumpThreshold)
+                        {
+                            candidateKey = null;
+                            candidateStableFrames = 0;
+                            objectAlreadyCounted = false;
+                            System.Diagnostics.Debug.WriteLine($"[CNT] 위치 점프 감지 ({lastLidX} → {lidBox.X}) - 새 뚜껑으로 보고 잠금 해제");
+                        }
+                        lastLidX = lidBox.X; // 다음 프레임 비교용으로 이번 위치 기억
+                    }
+
                     // [화면에 표시할 텍스트들] 이번 프레임에서 뭘 보여줄지 미리 준비해뒀다가
                     // 마지막에 한 번에 UI 스레드로 넘겨서 갱신함
                     string autoCaptureStatusText = isAutoCapturing
@@ -828,6 +1013,7 @@ namespace CameraNumberDetect
                                 candidateKey = null;
                                 candidateStableFrames = 0;
                                 objectAlreadyCounted = false;
+                                lastLidX = -1; // [신규] 화면이 완전히 비었으니 위치 기록도 초기화
                             }
                         }
                         else if (!isLidComplete)
@@ -902,6 +1088,14 @@ namespace CameraNumberDetect
                             }
                         }
 
+                        // [진단 로그] 프레임마다 카운트 상태를 한 줄로 출력 (원인 확정용, 로직엔 영향 없음)
+                        System.Diagnostics.Debug.WriteLine($"[CNT] color={lidColor} complete={isLidComplete} locked={objectAlreadyCounted} absent={absentFrameCount} stable={candidateStableFrames} key={candidateKey} boxX={lidBox.X} roi={analysisRoi.X}~{analysisRoi.X + analysisRoi.Width}");
+                        // [진단용] 같은 상태를 화면에도 표시 - 출력창 없이 눈으로 확인하기 위함
+                        string lockText = objectAlreadyCounted ? "ON" : "OFF";
+                        string completeText = isLidComplete ? "O" : "X";
+                        string debugStateText = $"[진단] 잠금: {lockText}   완성형: {completeText}\n"
+                            + $"없음 연속: {absentFrameCount}/{absentStabilityThreshold}   안정: {candidateStableFrames}/{stabilityThreshold}";
+
                         // [신규] Mat → Bitmap 변환은 Mat이 아직 살아있는(Dispose 되기 전) 이 시점에서 해야 함
                         System.Drawing.Bitmap mainBitmap = MatToBitmap(displayMat);
                         System.Drawing.Bitmap cropBitmap = MatToBitmap(croppedLid);
@@ -949,6 +1143,7 @@ namespace CameraNumberDetect
                             lblTotalCount.Text = statsTotalText;
                             lblColorCounts.Text = statsColorText;
                             lblDigitCounts.Text = statsDigitText;
+                            lblDebugState.Text = debugStateText; // [진단용]
                             panelCameraBorder.BackColor = borderColor;
                         });
                     }
